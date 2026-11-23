@@ -21,6 +21,7 @@
 #include "usb.h"
 #include "wake_on_lan.h"
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -1026,6 +1027,7 @@ static void schedule_speaker_silence_preroll() {
 }
 
 void audio_handle_controller_disconnect() {
+    haptic_synthesis_reset();
     test_haptics_active = false;
     test_haptics_preroll_packets_remaining = 0;
     test_haptics_packets_remaining = 0;
@@ -1176,6 +1178,147 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     return bt_write_audio_stream(pkt, sizeof(pkt));
 }
 
+// ============================================================================
+// High-Fidelity Tactile Haptic Synthesis Engine for DualSense & 3rd-Party Clones
+// ============================================================================
+static float synth_lp1 = 0.0f;
+static float synth_lp2 = 0.0f;
+static float synth_last_high = 0.0f;
+static float synth_env_bass = 0.0f;
+static float synth_env_high = 0.0f;
+static uint8_t synth_last_sent_right = 0;
+static uint8_t synth_last_sent_left = 0;
+static uint32_t synth_last_send_time_us = 0;
+static uint32_t synth_last_audio_activity_us = 0;
+
+static void haptic_synthesis_reset() {
+    synth_lp1 = 0.0f;
+    synth_lp2 = 0.0f;
+    synth_last_high = 0.0f;
+    synth_env_bass = 0.0f;
+    synth_env_high = 0.0f;
+    synth_last_sent_right = 0;
+    synth_last_sent_left = 0;
+    synth_last_send_time_us = 0;
+    synth_last_audio_activity_us = 0;
+}
+
+static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_bytes) {
+    if (!bt_is_controller_connected() || samples == nullptr || sample_bytes <= 0) {
+        return;
+    }
+
+    const uint32_t now = time_us_32();
+    float frame_peak_bass = 0.0f;
+    float frame_peak_high = 0.0f;
+    float frame_max_transient = 0.0f;
+
+    // 2-pole low-pass filter at ~130 Hz (sample rate = 3000 Hz, alpha = 0.214f)
+    constexpr float kAlpha = 0.214f;
+
+    const int pairs = sample_bytes / 2;
+    for (int i = 0; i < pairs; ++i) {
+        // Interleaved signed 8-bit stereo [-128..127] -> [-1.0f..1.0f]
+        float l = static_cast<float>(samples[i * 2]) / 127.0f;
+        float r = static_cast<float>(samples[i * 2 + 1]) / 127.0f;
+
+        // Quadraphonic native haptics: average both channels to form mono tactile signal
+        float mono = 0.5f * (l + r);
+
+        // 2-pole low-pass filter for bass rumble isolation
+        synth_lp1 += kAlpha * (mono - synth_lp1);
+        synth_lp2 += kAlpha * (synth_lp1 - synth_lp2);
+
+        float bass = synth_lp2;
+        float high = mono - synth_lp2;
+
+        float abs_bass = fabsf(bass);
+        float abs_high = fabsf(high);
+
+        if (abs_bass > frame_peak_bass) frame_peak_bass = abs_bass;
+        if (abs_high > frame_peak_high) frame_peak_high = abs_high;
+
+        // Transient edge detector: sudden change in high-frequency content
+        float d_high = fabsf(high - synth_last_high);
+        if (d_high > frame_max_transient) frame_max_transient = d_high;
+        synth_last_high = high;
+    }
+
+    // Blend high peak with transient impact for sharp tactile click punch
+    float effective_high = fmaxf(frame_peak_high, frame_max_transient * 1.6f);
+
+    // Track active audio
+    if (effective_high > 0.005f || frame_peak_bass > 0.005f) {
+        synth_last_audio_activity_us = now;
+    }
+
+    // Envelope followers:
+    // 1. High frequency / clicks (Right Motor - Light / Fast):
+    // Instant attack for razor-sharp transient clicks
+    if (effective_high > synth_env_high) {
+        synth_env_high = effective_high;
+    } else {
+        // Fast decay: drops to 30% per 10.6ms frame (~8ms half-life)
+        synth_env_high *= 0.30f;
+        if (synth_env_high < 0.005f) synth_env_high = 0.0f;
+    }
+
+    // 2. Bass rumble (Left Motor - Heavy / Slow):
+    // Smooth attack ramp for deep weight without mechanical click
+    if (frame_peak_bass > synth_env_bass) {
+        synth_env_bass = 0.4f * synth_env_bass + 0.6f * frame_peak_bass;
+        if (frame_peak_bass > synth_env_bass) synth_env_bass = frame_peak_bass;
+    } else {
+        // Resonant decay: drops to 70% per 10.6ms frame (~30ms half-life)
+        synth_env_bass *= 0.70f;
+        if (synth_env_bass < 0.005f) synth_env_bass = 0.0f;
+    }
+
+    // Perceptual Mapping (Zero Deadzone):
+    // Controllers have static friction below PWM ~24.
+    // Map normalized signal [0.006 .. 1.0] to [24 .. 255] using power curve 0.65
+    auto map_motor = [](float env) -> uint8_t {
+        if (env < 0.006f) return 0;
+        float norm = (env - 0.006f) / (1.0f - 0.006f);
+        if (norm > 1.0f) norm = 1.0f;
+        constexpr float MIN_PWM = 24.0f;
+        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 0.65f);
+        if (pwm > 255.0f) pwm = 255.0f;
+        return static_cast<uint8_t>(pwm + 0.5f);
+    };
+
+    uint8_t motor_right = map_motor(synth_env_high);
+    uint8_t motor_left  = map_motor(synth_env_bass);
+
+    // Pacing and transmission to controller
+    // If motor values changed, or if non-zero and interval elapsed (>= 5ms),
+    // or if both went to zero (instant stop), submit report!
+    bool changed = (motor_right != synth_last_sent_right || motor_left != synth_last_sent_left);
+    uint32_t elapsed_us = now - synth_last_send_time_us;
+
+    if (changed || ((motor_right | motor_left) != 0 && elapsed_us >= 5000)) {
+        // Enforce minimum gap of 3.5ms between reports unless stopping immediately
+        if (elapsed_us >= 3500 || ((motor_right | motor_left) == 0 && changed)) {
+            synth_last_sent_right = motor_right;
+            synth_last_sent_left = motor_left;
+            synth_last_send_time_us = now;
+            bt_submit_haptic_synthesis(motor_right, motor_left);
+        }
+    }
+}
+
+static void haptic_synthesis_loop(uint32_t now) {
+    if ((synth_last_sent_right > 0 || synth_last_sent_left > 0) &&
+        (now - synth_last_audio_activity_us > 25000)) {
+        synth_env_high = 0.0f;
+        synth_env_bass = 0.0f;
+        synth_last_sent_right = 0;
+        synth_last_sent_left = 0;
+        synth_last_send_time_us = now;
+        bt_submit_haptic_synthesis(0, 0);
+    }
+}
+
 static uint8_t haptic_0x32_counter = 0;
 
 static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) {
@@ -1262,6 +1405,7 @@ static void process_bridge_audio_frame(uint8_t const *frame) {
     }
     int8_t haptic_buf[SAMPLE_SIZE]{};
     memcpy(haptic_buf, frame, SAMPLE_SIZE);
+    haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
     if (send_audio_haptics_packet(haptic_buf, speaker_route_active, false)) {
         last_audio_us = time_us_32();
     }
@@ -1886,6 +2030,7 @@ void audio_test_haptics_loop() {
     int8_t haptic_buf[SAMPLE_SIZE]{};
     if (merge_test_haptics_overlay(haptic_buf, false)) {
         note_audio_haptics_producer_frame(time_us_32());
+        haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
         send_haptic_report_0x32(haptic_buf);
     }
 }
@@ -1999,6 +2144,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
+            haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
             if (speaker_route_demanded) {
                 send_audio_haptics_packet(audio_haptic_buf, true);
             } else {
@@ -2366,6 +2512,7 @@ void __not_in_flash_func(audio_loop)() {
     update_persistent_speaker_route();
     process_idle_speaker_silence_preroll(now);
 
+    haptic_synthesis_loop(now);
     (void)try_send_pending_audio_batch();
     for (uint8_t i = 0; i < AUDIO_LOOP_MAX_USB_READS; i++) {
         if (!process_usb_audio_packet()) {
