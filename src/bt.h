@@ -157,6 +157,7 @@ void bt_output_service_after_usb();
 bool bt_copy_feature_data(uint8_t report_id, uint8_t *buffer, uint16_t capacity, uint16_t *copied);
 void init_feature();
 void bt_arm_haptic_low_pass_filter();
+void bt_submit_haptic_synthesis(uint8_t right, uint8_t left);
 void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len);
 
 #endif //DS5_BRIDGE_BT_H
