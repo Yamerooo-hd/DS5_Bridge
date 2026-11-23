@@ -42,8 +42,6 @@
 #define AUDIO_BATCH_FRAMES 2
 #define REPORT_SIZE       547
 #define REPORT_ID         0x39
-#define REPORT_ID_HAPTICS_ONLY 0x32
-#define REPORT_SIZE_HAPTICS_ONLY 142
 #define DEFAULT_HAPTICS_BUFFER_LENGTH 64
 #define MIN_HAPTICS_BUFFER_LENGTH 16
 #define MAX_HAPTICS_BUFFER_LENGTH 128
@@ -1114,44 +1112,6 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
         }
     }
 
-    const bool speaker_payload_included = pending_audio_include_speaker;
-    const bool controller_mic_transport_enabled = mic_usb_output_active();
-    const uint8_t buffer_length = haptics_buffer_length;
-
-    if (!speaker_payload_included) {
-        // Pure Haptics Report 0x32 (142 bytes) - Native DualSense HD voice-coil haptics over Bluetooth
-        uint8_t pkt32[REPORT_SIZE_HAPTICS_ONLY]{};
-        pkt32[0] = REPORT_ID_HAPTICS_ONLY;
-        pkt32[1] = 0; // Sequence stamped by prepare_interrupt_output_packet_for_send in bt.cpp
-        pkt32[2] = 0x11 | (1 << 7);
-        pkt32[3] = 4;
-        pkt32[4] = controller_mic_transport_enabled ? 0x67 : 0x66;
-        pkt32[5] = buffer_length;
-        pkt32[6] = buffer_length;
-        packetCounter = static_cast<uint8_t>(packetCounter + AUDIO_BATCH_FRAMES);
-        pkt32[7] = packetCounter;
-        pkt32[8] = 0x12 | (1 << 6) | (1 << 7); // 0xD2: double frame haptics
-        pkt32[9] = SAMPLE_SIZE;
-        memcpy(pkt32 + 10, pending_audio_haptics[0], SAMPLE_SIZE);
-        memcpy(pkt32 + 10 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
-
-#ifdef ENABLE_COMPANION
-        for (uint8_t frame = 0; frame < AUDIO_BATCH_FRAMES; frame++) {
-            companion_note_feedback_trace_samples(
-                CompanionFeedbackTraceLocalAudio,
-                reinterpret_cast<uint8_t const *>(pending_audio_haptics[frame]),
-                SAMPLE_SIZE,
-                0,
-                clamp_debug_u8(queue_get_level(&audio_fifo)),
-                opus_debug_level(),
-                clamp_debug_u8(static_cast<uint32_t>(volume[1] * 100.0f))
-            );
-        }
-#endif
-        clear_pending_audio_batch();
-        return bt_write_audio_stream(pkt32, sizeof(pkt32));
-    }
-
     uint8_t pkt[REPORT_SIZE]{};
     pkt[0] = REPORT_ID;
     // The Bluetooth scheduler stamps the shared DualSense output sequence at
@@ -1159,7 +1119,9 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     pkt[1] = 0;
     pkt[2] = 0x11 | (1 << 7);
     pkt[3] = 6;
+    const bool controller_mic_transport_enabled = mic_usb_output_active();
     pkt[4] = ds5::output::audio_section_enable_mask(controller_mic_transport_enabled);
+    const uint8_t buffer_length = haptics_buffer_length;
     pkt[5] = buffer_length;
     pkt[6] = buffer_length;
     pkt[7] = buffer_length;
@@ -1170,6 +1132,8 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     pkt[11] = SAMPLE_SIZE;
     memcpy(pkt + 12, pending_audio_haptics[0], SAMPLE_SIZE);
     memcpy(pkt + 12 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
+
+    const bool speaker_payload_included = pending_audio_include_speaker;
     if (speaker_payload_included) {
         const bool force_route = !speaker_route_active || speaker_route_headset != plug_headset;
         if (force_route) {
@@ -1210,6 +1174,41 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 
     clear_pending_audio_batch();
     return bt_write_audio_stream(pkt, sizeof(pkt));
+}
+
+static uint8_t haptic_0x32_counter = 0;
+
+static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) {
+    if (!bt_is_controller_connected() || samples == nullptr) {
+        return false;
+    }
+    uint8_t pkt32[142]{};
+    pkt32[0] = 0x32;
+    pkt32[1] = 0;
+    pkt32[2] = 0x91;
+    pkt32[3] = 0x07;
+    pkt32[4] = 0xFE;
+    for (int i = 5; i <= 9; ++i) {
+        pkt32[i] = 64; // ControllerQueueFrames
+    }
+    pkt32[10] = haptic_0x32_counter++;
+    pkt32[11] = 0x92;
+    pkt32[12] = 64; // SamplesBytes (32 stereo samples at 3 kHz)
+    memcpy(pkt32 + 13, samples, 64);
+
+#ifdef ENABLE_COMPANION
+    companion_note_feedback_trace_samples(
+        CompanionFeedbackTraceLocalAudio,
+        reinterpret_cast<uint8_t const *>(samples),
+        SAMPLE_SIZE,
+        0,
+        clamp_debug_u8(queue_get_level(&audio_fifo)),
+        opus_debug_level(),
+        clamp_debug_u8(static_cast<uint32_t>(volume[1] * 100.0f))
+    );
+#endif
+
+    return bt_write_audio_stream(pkt32, sizeof(pkt32));
 }
 
 static bool __not_in_flash_func(send_audio_haptics_packet)(
@@ -1647,6 +1646,7 @@ bool audio_schedule_test_haptics() {
         }
         last_audio_us = 0;
     }
+    bt_arm_haptic_low_pass_filter();
     test_haptics_active = true;
     test_haptics_preroll_packets_remaining = TEST_HAPTICS_PREROLL_PACKET_COUNT;
     test_haptics_packets_remaining = TEST_HAPTICS_PACKET_COUNT;
@@ -1886,7 +1886,7 @@ void audio_test_haptics_loop() {
     int8_t haptic_buf[SAMPLE_SIZE]{};
     if (merge_test_haptics_overlay(haptic_buf, false)) {
         note_audio_haptics_producer_frame(time_us_32());
-        send_audio_haptics_packet(haptic_buf, speaker_route_active, false);
+        send_haptic_report_0x32(haptic_buf);
     }
 }
 
@@ -1919,6 +1919,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     }
     speaker_silence_preroll_packets_remaining = 0;
     audio_silence_tail_logged = false;
+    if (last_audio_us == 0) { bt_arm_haptic_low_pass_filter(); }
     last_audio_us = now;
 
     WDL_ResampleSample *in_buf;
@@ -1998,7 +1999,11 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
-            send_audio_haptics_packet(audio_haptic_buf, speaker_route_demanded);
+            if (speaker_route_demanded) {
+                send_audio_haptics_packet(audio_haptic_buf, true);
+            } else {
+                send_haptic_report_0x32(audio_haptic_buf);
+            }
         }
     }
     return true;
