@@ -4101,6 +4101,7 @@ static void finish_hid_session_if_ready() {
     reset_lightbar_setup();
     bt_set_lightbar_color(0x00, 0x00, 0xff, 100);
     bt_schedule_lightbar_restore(250);
+    bt_arm_haptic_low_pass_filter();
 }
 
 static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(handle_l2cap_can_send_now)(uint8_t *packet) {
@@ -5725,6 +5726,17 @@ void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len) {
         DS5_LOG("[L2CAP] Requesting Set Feature Report 0x%02X\n", reportId);
         DS5_HEXDUMP(set_feature, set_feature_len);
     }
+}
+
+void bt_arm_haptic_low_pass_filter() {
+    if (hid_interrupt_cid == 0) {
+        return;
+    }
+    uint8_t report[DS_OUTPUT_REPORT_BT_SIZE]{};
+    ds5::output::init_bt_output_report(report, 0);
+    report[3 + ds5::output::kValidFlag1Offset] = 0x62;
+    report[3 + ds5::output::kHapticLowPassFilterOffset] = 0x01;
+    bt_write(report, sizeof(report));
 }
 
 void init_feature() {
