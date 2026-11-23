@@ -5728,6 +5728,22 @@ void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len) {
     }
 }
 
+void bt_submit_haptic_synthesis(uint8_t right, uint8_t left) {
+    if (hid_interrupt_cid == 0) {
+        return;
+    }
+    uint8_t report[DS_OUTPUT_REPORT_BT_SIZE];
+    init_state_report(report);
+    controller_output_policy_render_classic_rumble_payload(
+        report + 3,
+        DS_OUTPUT_REPORT_COMMON_SIZE,
+        right,
+        left
+    );
+    apply_classic_rumble_gain(report, sizeof(report));
+    bt_write(report, sizeof(report));
+}
+
 void bt_arm_haptic_low_pass_filter() {
     if (hid_interrupt_cid == 0) {
         return;
