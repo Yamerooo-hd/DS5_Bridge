@@ -38,8 +38,6 @@ bool cached_player_leds_valid = false;
 // The host released the player LEDs on purpose; no fallback until it sets
 // a pattern again or the controller reconnects.
 bool host_released_player_leds = false;
-uint8_t audio_haptic_rumble_left = 0;
-uint8_t audio_haptic_rumble_right = 0;
 
 uint8_t normalize_speaker_gain(uint8_t gain) {
     return std::min<uint8_t>(7, std::max<uint8_t>(1, gain));
@@ -229,22 +227,7 @@ void controller_output_state_reset_cached_player_leds() {
     host_released_player_leds = false;
 }
 
-void controller_output_state_set_audio_haptic_rumble(uint8_t left, uint8_t right) {
-    audio_haptic_rumble_left = left;
-    audio_haptic_rumble_right = right;
-}
-
-uint8_t controller_output_state_get_audio_haptic_rumble_left() {
-    return audio_haptic_rumble_left;
-}
-
-uint8_t controller_output_state_get_audio_haptic_rumble_right() {
-    return audio_haptic_rumble_right;
-}
-
 void controller_output_state_reset() {
-    audio_haptic_rumble_left = 0;
-    audio_haptic_rumble_right = 0;
     const uint8_t defaults[kAudioStateSnapshotSize] = {
         0xfd, 0xf7, 0x0, 0x0,
         0x7f, 0x64,
@@ -342,12 +325,8 @@ void controller_output_state_apply_host_payload(uint8_t const *data, uint8_t len
                 ))
             );
         }
-        state_data[kMotorRightOffset] = std::max(update[kMotorRightOffset], audio_haptic_rumble_right);
-        state_data[kMotorLeftOffset] = std::max(update[kMotorLeftOffset], audio_haptic_rumble_left);
-    } else if ((audio_haptic_rumble_left | audio_haptic_rumble_right) != 0) {
-        state_data[kValidFlag0Offset] |= (kFlag0CompatibleVibration | kFlag0HapticsSelect);
-        state_data[kMotorRightOffset] = audio_haptic_rumble_right;
-        state_data[kMotorLeftOffset] = audio_haptic_rumble_left;
+        state_data[kMotorRightOffset] = update[kMotorRightOffset];
+        state_data[kMotorLeftOffset] = update[kMotorLeftOffset];
     } else {
         // Host reports are complete updates. A later 0x36 carrier must not
         // resurrect rumble from a prior selector-bearing report.
