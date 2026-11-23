@@ -8,6 +8,7 @@
 #include "bt.h"
 #include "controller_output_policy.h"
 #include "controller_output_state.h"
+#include "controller_output_submit.h"
 #include "dualsense_output.h"
 #include "haptics_test_signal.h"
 #include "persona/host_persona.h"
@@ -1025,7 +1026,10 @@ static void schedule_speaker_silence_preroll() {
     audio_debug_packet_log_budget = max<uint8_t>(audio_debug_packet_log_budget, 4);
 }
 
+static void submit_audio_haptics_rumble(uint8_t left, uint8_t right);
+
 void audio_handle_controller_disconnect() {
+    submit_audio_haptics_rumble(0, 0);
     test_haptics_active = false;
     test_haptics_preroll_packets_remaining = 0;
     test_haptics_packets_remaining = 0;
@@ -1176,6 +1180,35 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     return bt_write_audio_stream(pkt, sizeof(pkt));
 }
 
+static uint8_t last_audio_haptic_rumble_l = 0;
+static uint8_t last_audio_haptic_rumble_r = 0;
+static uint32_t last_audio_haptic_rumble_time_us = 0;
+static float audio_rumble_env_l = 0.0f;
+static float audio_rumble_env_r = 0.0f;
+
+static void submit_audio_haptics_rumble(uint8_t left, uint8_t right) {
+    if (!bt_is_controller_connected()) {
+        last_audio_haptic_rumble_l = 0;
+        last_audio_haptic_rumble_r = 0;
+        audio_rumble_env_l = 0.0f;
+        audio_rumble_env_r = 0.0f;
+        controller_output_state_set_audio_haptic_rumble(0, 0);
+        return;
+    }
+
+    if (left == last_audio_haptic_rumble_l && right == last_audio_haptic_rumble_r) {
+        return;
+    }
+
+    last_audio_haptic_rumble_l = left;
+    last_audio_haptic_rumble_r = right;
+    controller_output_state_set_audio_haptic_rumble(left, right);
+
+    uint8_t payload[ds5::output::kCommonPayloadSize]{};
+    controller_output_policy_render_classic_rumble_payload(payload, sizeof(payload), right, left);
+    controller_output_submit_usb_payload(payload, sizeof(payload));
+}
+
 static bool __not_in_flash_func(send_audio_haptics_packet)(
     const int8_t *haptic_buf,
     bool include_speaker,
@@ -1206,6 +1239,51 @@ static bool __not_in_flash_func(send_audio_haptics_packet)(
     if (merge_test_overlay && test_haptics_active) {
         (void)merge_test_haptics_overlay(pending, include_speaker);
     }
+
+    // Measure haptic PCM amplitude and drive classic rumble motors
+    int max_l = 0;
+    int max_r = 0;
+    for (int i = 0; i < SAMPLE_SIZE; i += 2) {
+        int val_l = std::abs(static_cast<int>(pending[i]));
+        int val_r = std::abs(static_cast<int>(pending[i + 1]));
+        if (val_l > max_l) max_l = val_l;
+        if (val_r > max_r) max_r = val_r;
+    }
+
+    float target_l = 0.0f;
+    if (max_l > 1) {
+        target_l = 35.0f + (static_cast<float>(max_l) / 127.0f) * 220.0f;
+        if (target_l > 255.0f) target_l = 255.0f;
+    }
+    float target_r = 0.0f;
+    if (max_r > 1) {
+        target_r = 35.0f + (static_cast<float>(max_r) / 127.0f) * 220.0f;
+        if (target_r > 255.0f) target_r = 255.0f;
+    }
+
+    if (target_l >= audio_rumble_env_l) {
+        audio_rumble_env_l = target_l;
+    } else {
+        audio_rumble_env_l *= 0.70f;
+        if (audio_rumble_env_l < 20.0f) audio_rumble_env_l = 0.0f;
+    }
+
+    if (target_r >= audio_rumble_env_r) {
+        audio_rumble_env_r = target_r;
+    } else {
+        audio_rumble_env_r *= 0.70f;
+        if (audio_rumble_env_r < 20.0f) audio_rumble_env_r = 0.0f;
+    }
+
+    uint8_t motor_l = static_cast<uint8_t>(audio_rumble_env_l);
+    uint8_t motor_r = static_cast<uint8_t>(audio_rumble_env_r);
+
+    motor_l = controller_output_policy_scale_classic_rumble_byte(motor_l);
+    motor_r = controller_output_policy_scale_classic_rumble_byte(motor_r);
+
+    submit_audio_haptics_rumble(motor_l, motor_r);
+    last_audio_haptic_rumble_time_us = time_us_32();
+
     pending_audio_include_speaker = include_speaker;
     pending_audio_haptics_count++;
     return try_send_pending_audio_batch() || sent;
@@ -2296,6 +2374,12 @@ void __not_in_flash_func(audio_loop)() {
     if (audio_haptics_replace_rumble_clear_pending) {
         audio_haptics_replace_rumble_clear_pending = false;
         controller_output_state_clear_classic_rumble();
+    }
+    if ((last_audio_haptic_rumble_l > 0 || last_audio_haptic_rumble_r > 0) &&
+        (now - last_audio_haptic_rumble_time_us > 30000)) {
+        audio_rumble_env_l = 0.0f;
+        audio_rumble_env_r = 0.0f;
+        submit_audio_haptics_rumble(0, 0);
     }
     (void)controller_output_policy_poll_audio_haptics_producer(now);
     process_mic_usb_output();
