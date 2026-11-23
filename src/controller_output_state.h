@@ -25,8 +25,5 @@ uint8_t controller_output_state_speaker_gain();
 bool controller_output_state_copy_player_led_report(uint8_t *destination, uint16_t len);
 void controller_output_state_copy_audio_snapshot(uint8_t *destination, bool headset_plugged);
 void controller_output_state_clear_triggers(uint8_t *payload);
-void controller_output_state_set_audio_haptic_rumble(uint8_t left, uint8_t right);
-uint8_t controller_output_state_get_audio_haptic_rumble_left();
-uint8_t controller_output_state_get_audio_haptic_rumble_right();
 
 #endif // DS5_BRIDGE_CONTROLLER_OUTPUT_STATE_H
