@@ -8,7 +8,6 @@
 #include "bt.h"
 #include "controller_output_policy.h"
 #include "controller_output_state.h"
-#include "controller_output_submit.h"
 #include "dualsense_output.h"
 #include "haptics_test_signal.h"
 #include "persona/host_persona.h"
@@ -43,6 +42,8 @@
 #define AUDIO_BATCH_FRAMES 2
 #define REPORT_SIZE       547
 #define REPORT_ID         0x39
+#define REPORT_ID_HAPTICS_ONLY 0x32
+#define REPORT_SIZE_HAPTICS_ONLY 142
 #define DEFAULT_HAPTICS_BUFFER_LENGTH 64
 #define MIN_HAPTICS_BUFFER_LENGTH 16
 #define MAX_HAPTICS_BUFFER_LENGTH 128
@@ -1026,10 +1027,7 @@ static void schedule_speaker_silence_preroll() {
     audio_debug_packet_log_budget = max<uint8_t>(audio_debug_packet_log_budget, 4);
 }
 
-static void submit_audio_haptics_rumble(uint8_t left, uint8_t right);
-
 void audio_handle_controller_disconnect() {
-    submit_audio_haptics_rumble(0, 0);
     test_haptics_active = false;
     test_haptics_preroll_packets_remaining = 0;
     test_haptics_packets_remaining = 0;
@@ -1116,6 +1114,44 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
         }
     }
 
+    const bool speaker_payload_included = pending_audio_include_speaker;
+    const bool controller_mic_transport_enabled = mic_usb_output_active();
+    const uint8_t buffer_length = haptics_buffer_length;
+
+    if (!speaker_payload_included) {
+        // Pure Haptics Report 0x32 (142 bytes) - Native DualSense HD voice-coil haptics over Bluetooth
+        uint8_t pkt32[REPORT_SIZE_HAPTICS_ONLY]{};
+        pkt32[0] = REPORT_ID_HAPTICS_ONLY;
+        pkt32[1] = 0; // Sequence stamped by prepare_interrupt_output_packet_for_send in bt.cpp
+        pkt32[2] = 0x11 | (1 << 7);
+        pkt32[3] = 4;
+        pkt32[4] = controller_mic_transport_enabled ? 0x67 : 0x66;
+        pkt32[5] = buffer_length;
+        pkt32[6] = buffer_length;
+        packetCounter = static_cast<uint8_t>(packetCounter + AUDIO_BATCH_FRAMES);
+        pkt32[7] = packetCounter;
+        pkt32[8] = 0x12 | (1 << 6) | (1 << 7); // 0xD2: double frame haptics
+        pkt32[9] = SAMPLE_SIZE;
+        memcpy(pkt32 + 10, pending_audio_haptics[0], SAMPLE_SIZE);
+        memcpy(pkt32 + 10 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
+
+#ifdef ENABLE_COMPANION
+        for (uint8_t frame = 0; frame < AUDIO_BATCH_FRAMES; frame++) {
+            companion_note_feedback_trace_samples(
+                CompanionFeedbackTraceLocalAudio,
+                reinterpret_cast<uint8_t const *>(pending_audio_haptics[frame]),
+                SAMPLE_SIZE,
+                0,
+                clamp_debug_u8(queue_get_level(&audio_fifo)),
+                opus_debug_level(),
+                clamp_debug_u8(static_cast<uint32_t>(volume[1] * 100.0f))
+            );
+        }
+#endif
+        clear_pending_audio_batch();
+        return bt_write_audio_stream(pkt32, sizeof(pkt32));
+    }
+
     uint8_t pkt[REPORT_SIZE]{};
     pkt[0] = REPORT_ID;
     // The Bluetooth scheduler stamps the shared DualSense output sequence at
@@ -1123,9 +1159,7 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     pkt[1] = 0;
     pkt[2] = 0x11 | (1 << 7);
     pkt[3] = 6;
-    const bool controller_mic_transport_enabled = mic_usb_output_active();
     pkt[4] = ds5::output::audio_section_enable_mask(controller_mic_transport_enabled);
-    const uint8_t buffer_length = haptics_buffer_length;
     pkt[5] = buffer_length;
     pkt[6] = buffer_length;
     pkt[7] = buffer_length;
@@ -1136,8 +1170,6 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     pkt[11] = SAMPLE_SIZE;
     memcpy(pkt + 12, pending_audio_haptics[0], SAMPLE_SIZE);
     memcpy(pkt + 12 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
-
-    const bool speaker_payload_included = pending_audio_include_speaker;
     if (speaker_payload_included) {
         const bool force_route = !speaker_route_active || speaker_route_headset != plug_headset;
         if (force_route) {
@@ -1180,35 +1212,6 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
     return bt_write_audio_stream(pkt, sizeof(pkt));
 }
 
-static uint8_t last_audio_haptic_rumble_l = 0;
-static uint8_t last_audio_haptic_rumble_r = 0;
-static uint32_t last_audio_haptic_rumble_time_us = 0;
-static float audio_rumble_env_l = 0.0f;
-static float audio_rumble_env_r = 0.0f;
-
-static void submit_audio_haptics_rumble(uint8_t left, uint8_t right) {
-    if (!bt_is_controller_connected()) {
-        last_audio_haptic_rumble_l = 0;
-        last_audio_haptic_rumble_r = 0;
-        audio_rumble_env_l = 0.0f;
-        audio_rumble_env_r = 0.0f;
-        controller_output_state_set_audio_haptic_rumble(0, 0);
-        return;
-    }
-
-    if (left == last_audio_haptic_rumble_l && right == last_audio_haptic_rumble_r) {
-        return;
-    }
-
-    last_audio_haptic_rumble_l = left;
-    last_audio_haptic_rumble_r = right;
-    controller_output_state_set_audio_haptic_rumble(left, right);
-
-    uint8_t payload[ds5::output::kCommonPayloadSize]{};
-    controller_output_policy_render_classic_rumble_payload(payload, sizeof(payload), right, left);
-    controller_output_submit_usb_payload(payload, sizeof(payload));
-}
-
 static bool __not_in_flash_func(send_audio_haptics_packet)(
     const int8_t *haptic_buf,
     bool include_speaker,
@@ -1239,51 +1242,6 @@ static bool __not_in_flash_func(send_audio_haptics_packet)(
     if (merge_test_overlay && test_haptics_active) {
         (void)merge_test_haptics_overlay(pending, include_speaker);
     }
-
-    // Measure haptic PCM amplitude and drive classic rumble motors
-    int max_l = 0;
-    int max_r = 0;
-    for (int i = 0; i < SAMPLE_SIZE; i += 2) {
-        int val_l = std::abs(static_cast<int>(pending[i]));
-        int val_r = std::abs(static_cast<int>(pending[i + 1]));
-        if (val_l > max_l) max_l = val_l;
-        if (val_r > max_r) max_r = val_r;
-    }
-
-    float target_l = 0.0f;
-    if (max_l > 1) {
-        target_l = 35.0f + (static_cast<float>(max_l) / 127.0f) * 220.0f;
-        if (target_l > 255.0f) target_l = 255.0f;
-    }
-    float target_r = 0.0f;
-    if (max_r > 1) {
-        target_r = 35.0f + (static_cast<float>(max_r) / 127.0f) * 220.0f;
-        if (target_r > 255.0f) target_r = 255.0f;
-    }
-
-    if (target_l >= audio_rumble_env_l) {
-        audio_rumble_env_l = target_l;
-    } else {
-        audio_rumble_env_l *= 0.70f;
-        if (audio_rumble_env_l < 20.0f) audio_rumble_env_l = 0.0f;
-    }
-
-    if (target_r >= audio_rumble_env_r) {
-        audio_rumble_env_r = target_r;
-    } else {
-        audio_rumble_env_r *= 0.70f;
-        if (audio_rumble_env_r < 20.0f) audio_rumble_env_r = 0.0f;
-    }
-
-    uint8_t motor_l = static_cast<uint8_t>(audio_rumble_env_l);
-    uint8_t motor_r = static_cast<uint8_t>(audio_rumble_env_r);
-
-    motor_l = controller_output_policy_scale_classic_rumble_byte(motor_l);
-    motor_r = controller_output_policy_scale_classic_rumble_byte(motor_r);
-
-    submit_audio_haptics_rumble(motor_l, motor_r);
-    last_audio_haptic_rumble_time_us = time_us_32();
-
     pending_audio_include_speaker = include_speaker;
     pending_audio_haptics_count++;
     return try_send_pending_audio_batch() || sent;
@@ -2374,12 +2332,6 @@ void __not_in_flash_func(audio_loop)() {
     if (audio_haptics_replace_rumble_clear_pending) {
         audio_haptics_replace_rumble_clear_pending = false;
         controller_output_state_clear_classic_rumble();
-    }
-    if ((last_audio_haptic_rumble_l > 0 || last_audio_haptic_rumble_r > 0) &&
-        (now - last_audio_haptic_rumble_time_us > 30000)) {
-        audio_rumble_env_l = 0.0f;
-        audio_rumble_env_r = 0.0f;
-        submit_audio_haptics_rumble(0, 0);
     }
     (void)controller_output_policy_poll_audio_haptics_producer(now);
     process_mic_usb_output();
