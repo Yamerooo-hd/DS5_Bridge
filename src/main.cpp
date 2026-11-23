@@ -13,7 +13,6 @@
 #include "controller_packet_compositor.h"
 #include "controller_output_policy.h"
 #include "controller_output_submit.h"
-#include "controller_output_state.h"
 #include "utils.h"
 #include "resample.h"
 #include "audio.h"
@@ -286,17 +285,6 @@ void controller_output_submit_usb_payload(uint8_t const *payload, uint16_t paylo
     );
     controller_output_policy_sanitize_host_speaker_amp_payload(audioStateData, payloadLen);
     controller_output_policy_sanitize_host_mic_payload(audioStateData, payloadLen);
-
-    const uint8_t audio_rumble_l = controller_output_state_get_audio_haptic_rumble_left();
-    const uint8_t audio_rumble_r = controller_output_state_get_audio_haptic_rumble_right();
-    if ((audio_rumble_l | audio_rumble_r) != 0 && payloadLen > ds5::output::kMotorLeftOffset) {
-        outputData[3 + ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
-        outputData[3 + ds5::output::kMotorRightOffset] = std::max(outputData[3 + ds5::output::kMotorRightOffset], audio_rumble_r);
-        outputData[3 + ds5::output::kMotorLeftOffset] = std::max(outputData[3 + ds5::output::kMotorLeftOffset], audio_rumble_l);
-        audioStateData[ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
-        audioStateData[ds5::output::kMotorRightOffset] = std::max(audioStateData[ds5::output::kMotorRightOffset], audio_rumble_r);
-        audioStateData[ds5::output::kMotorLeftOffset] = std::max(audioStateData[ds5::output::kMotorLeftOffset], audio_rumble_l);
-    }
 
     if (!bt_write_classified_output(outputData, sizeof(outputData))) {
         // Do not publish rejected output into future audio carriers.
