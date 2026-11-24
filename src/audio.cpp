@@ -1193,8 +1193,11 @@ static uint8_t synth_last_sent_left = 0;
 static uint32_t synth_last_send_time_us = 0;
 static uint32_t synth_last_audio_activity_us = 0;
 
-// Noise gate: 0.025f (2.5% amplitude). Eliminates idle background music & ambient air hum.
-constexpr float NOISE_GATE = 0.025f;
+// Ambient noise gate: 0.20f (20% amplitude).
+// Live audio traces show game ambient wind, dialogue, and city soundtrack stream
+// continuously at 5% - 18%. Gating at 20% guarantees dead silence during movement,
+// so physical impacts (web shoots, punches, footsteps, landings) feel crisp and punchy.
+constexpr float NOISE_GATE = 0.20f;
 
 static void haptic_synthesis_reset() {
     synth_env_left = 0.0f;
@@ -1240,8 +1243,8 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     }
 
     // Combine peak magnitude and transient edge punch
-    float strike_left  = fmaxf(frame_peak_left, frame_transient_left * 1.5f);
-    float strike_right = fmaxf(frame_peak_right, frame_transient_right * 1.5f);
+    float strike_left  = fmaxf(frame_peak_left, frame_transient_left * 1.4f);
+    float strike_right = fmaxf(frame_peak_right, frame_transient_right * 1.4f);
 
     // Strict noise gate against ambient game soundtrack / wind
     if (strike_left < NOISE_GATE) strike_left = 0.0f;
@@ -1251,30 +1254,28 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         synth_last_audio_activity_us = now;
     }
 
-    // Envelope Follower with Instant Attack & Ultra-Fast Tactile Decay
-    // Left Channel:
+    // Envelope Follower with Instant Attack & Ultra-Fast Single-Frame Decay
     if (strike_left > synth_env_left) {
         synth_env_left = strike_left;
     } else {
-        synth_env_left *= 0.25f; // 75% decay in 10.6ms
+        synth_env_left *= 0.15f; // Drops 85% per 10.6ms frame
         if (synth_env_left < NOISE_GATE) synth_env_left = 0.0f;
     }
 
-    // Right Channel:
     if (strike_right > synth_env_right) {
         synth_env_right = strike_right;
     } else {
-        synth_env_right *= 0.25f; // 75% decay in 10.6ms
+        synth_env_right *= 0.15f; // Drops 85% per 10.6ms frame
         if (synth_env_right < NOISE_GATE) synth_env_right = 0.0f;
     }
 
-    // Dynamic Range Perceptual Mapping (Quadratic curve, no compressed buzzing)
+    // Dynamic Range Perceptual Mapping (Linear-to-exponential curve)
     auto map_actuator = [](float env) -> uint8_t {
         if (env < NOISE_GATE) return 0;
         float norm = (env - NOISE_GATE) / (1.0f - NOISE_GATE);
         if (norm > 1.0f) norm = 1.0f;
-        constexpr float MIN_PWM = 16.0f;
-        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 1.35f);
+        constexpr float MIN_PWM = 24.0f;
+        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 1.20f);
         if (pwm > 255.0f) pwm = 255.0f;
         return static_cast<uint8_t>(pwm + 0.5f);
     };
