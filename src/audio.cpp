@@ -1182,32 +1182,33 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 }
 
 // ============================================================================
-// High-Fidelity Dual-Channel Tactile Haptic Engine (Stereo Independent)
+// Tactile Impact Kick Engine (Haptic Overdrive for DualSense Clones)
 // ============================================================================
-static float synth_env_left = 0.0f;
-static float synth_env_right = 0.0f;
+static uint32_t kick_end_time_left_us = 0;
+static uint32_t kick_end_time_right_us = 0;
+static uint8_t kick_pwm_left = 0;
+static uint8_t kick_pwm_right = 0;
 static float synth_last_left = 0.0f;
 static float synth_last_right = 0.0f;
 static uint8_t synth_last_sent_right = 0;
 static uint8_t synth_last_sent_left = 0;
 static uint32_t synth_last_send_time_us = 0;
-static uint32_t synth_last_audio_activity_us = 0;
 
-// Ambient noise gate: 0.20f (20% amplitude).
-// Live audio traces show game ambient wind, dialogue, and city soundtrack stream
-// continuously at 5% - 18%. Gating at 20% guarantees dead silence during movement,
-// so physical impacts (web shoots, punches, footsteps, landings) feel crisp and punchy.
-constexpr float NOISE_GATE = 0.20f;
+// Ambient noise gate: 0.18f (18% amplitude).
+// Ambient city hum and wind stay below 18% (100% silent).
+// Impacts (web shoots, punches, footsteps, landings) trigger full-power overdrive kicks.
+constexpr float NOISE_GATE = 0.18f;
 
 static void haptic_synthesis_reset() {
-    synth_env_left = 0.0f;
-    synth_env_right = 0.0f;
+    kick_end_time_left_us = 0;
+    kick_end_time_right_us = 0;
+    kick_pwm_left = 0;
+    kick_pwm_right = 0;
     synth_last_left = 0.0f;
     synth_last_right = 0.0f;
     synth_last_sent_right = 0;
     synth_last_sent_left = 0;
     synth_last_send_time_us = 0;
-    synth_last_audio_activity_us = 0;
 }
 
 static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_bytes) {
@@ -1243,45 +1244,33 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     }
 
     // Combine peak magnitude and transient edge punch
-    float strike_left  = fmaxf(frame_peak_left, frame_transient_left * 1.4f);
-    float strike_right = fmaxf(frame_peak_right, frame_transient_right * 1.4f);
+    float strike_left  = fmaxf(frame_peak_left, frame_transient_left * 1.5f);
+    float strike_right = fmaxf(frame_peak_right, frame_transient_right * 1.5f);
 
-    // Strict noise gate against ambient game soundtrack / wind
-    if (strike_left < NOISE_GATE) strike_left = 0.0f;
-    if (strike_right < NOISE_GATE) strike_right = 0.0f;
-
-    if (strike_left > 0.0f || strike_right > 0.0f) {
-        synth_last_audio_activity_us = now;
+    // Left Channel Haptic Overdrive Kick Trigger (Heavy weight / Deep Thud)
+    if (strike_left >= NOISE_GATE) {
+        // Overdrive pulse: full torque kick to break motor inertia and create a real physical THUD
+        uint32_t pulse_duration_us = (strike_left > 0.40f) ? 38000 : 24000;
+        kick_end_time_left_us = now + pulse_duration_us;
+        kick_pwm_left = (strike_left > 0.40f) ? 255 : 210;
     }
 
-    // Envelope Follower with Instant Attack & Ultra-Fast Single-Frame Decay
-    if (strike_left > synth_env_left) {
-        synth_env_left = strike_left;
-    } else {
-        synth_env_left *= 0.15f; // Drops 85% per 10.6ms frame
-        if (synth_env_left < NOISE_GATE) synth_env_left = 0.0f;
+    // Right Channel Haptic Overdrive Kick Trigger (Light weight / Sharp Snap)
+    if (strike_right >= NOISE_GATE) {
+        uint32_t pulse_duration_us = (strike_right > 0.40f) ? 30000 : 18000;
+        kick_end_time_right_us = now + pulse_duration_us;
+        kick_pwm_right = (strike_right > 0.40f) ? 255 : 200;
     }
 
-    if (strike_right > synth_env_right) {
-        synth_env_right = strike_right;
-    } else {
-        synth_env_right *= 0.15f; // Drops 85% per 10.6ms frame
-        if (synth_env_right < NOISE_GATE) synth_env_right = 0.0f;
+    uint8_t motor_left = 0;
+    uint8_t motor_right = 0;
+
+    if (!time_reached(now, kick_end_time_left_us)) {
+        motor_left = kick_pwm_left;
     }
-
-    // Dynamic Range Perceptual Mapping (Linear-to-exponential curve)
-    auto map_actuator = [](float env) -> uint8_t {
-        if (env < NOISE_GATE) return 0;
-        float norm = (env - NOISE_GATE) / (1.0f - NOISE_GATE);
-        if (norm > 1.0f) norm = 1.0f;
-        constexpr float MIN_PWM = 24.0f;
-        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 1.20f);
-        if (pwm > 255.0f) pwm = 255.0f;
-        return static_cast<uint8_t>(pwm + 0.5f);
-    };
-
-    uint8_t motor_left  = map_actuator(synth_env_left);
-    uint8_t motor_right = map_actuator(synth_env_right);
+    if (!time_reached(now, kick_end_time_right_us)) {
+        motor_right = kick_pwm_right;
+    }
 
     bool is_zero = ((motor_right | motor_left) == 0);
     bool was_zero = ((synth_last_sent_right | synth_last_sent_left) == 0);
@@ -1289,13 +1278,12 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     uint32_t elapsed_us = now - synth_last_send_time_us;
 
     if (is_zero && !was_zero) {
-        // Instant active braking: kill motor power immediately with zero latency
+        // Immediate active stop / braking (zero latency)
         synth_last_sent_right = 0;
         synth_last_sent_left = 0;
         synth_last_send_time_us = now;
         bt_submit_haptic_synthesis(0, 0);
     } else if (!is_zero) {
-        // Enforce 3.5ms pacing for changes, or 10ms refresh for sustained rumbles
         if ((changed && elapsed_us >= 3500) || elapsed_us >= 10000) {
             synth_last_sent_right = motor_right;
             synth_last_sent_left = motor_left;
@@ -1307,9 +1295,7 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
 
 static void haptic_synthesis_loop(uint32_t now) {
     if ((synth_last_sent_right > 0 || synth_last_sent_left > 0) &&
-        (now - synth_last_audio_activity_us > 15000)) {
-        synth_env_left = 0.0f;
-        synth_env_right = 0.0f;
+        time_reached(now, kick_end_time_left_us) && time_reached(now, kick_end_time_right_us)) {
         synth_last_sent_right = 0;
         synth_last_sent_left = 0;
         synth_last_send_time_us = now;
@@ -1403,7 +1389,7 @@ static void process_bridge_audio_frame(uint8_t const *frame) {
     }
     int8_t haptic_buf[SAMPLE_SIZE]{};
     memcpy(haptic_buf, frame, SAMPLE_SIZE);
-    // haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
+    haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
     if (send_audio_haptics_packet(haptic_buf, speaker_route_active, false)) {
         last_audio_us = time_us_32();
     }
@@ -2028,7 +2014,7 @@ void audio_test_haptics_loop() {
     int8_t haptic_buf[SAMPLE_SIZE]{};
     if (merge_test_haptics_overlay(haptic_buf, false)) {
         note_audio_haptics_producer_frame(time_us_32());
-        // haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
+        haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
         send_haptic_report_0x32(haptic_buf);
     }
 }
@@ -2142,7 +2128,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
-            // haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
+            haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
             if (speaker_route_demanded) {
                 send_audio_haptics_packet(audio_haptic_buf, true);
             } else {
