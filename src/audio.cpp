@@ -300,6 +300,9 @@ static bool append_resampled_haptic_sample(float left, float right, float gain);
 static bool speaker_opus_batch_ready();
 static bool try_send_pending_audio_batch();
 static void clear_pending_audio_batch();
+static void haptic_synthesis_reset();
+static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_bytes);
+static void haptic_synthesis_loop(uint32_t now);
 #if DS5_AUDIO_DEBUG_ENABLED
 static void audio_debug_log_impl(
     AudioDebugEventCode code,
