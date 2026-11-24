@@ -1182,11 +1182,11 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 }
 
 // ============================================================================
-// High-Fidelity Tactile Haptic Synthesis Engine for DualSense & 3rd-Party Clones
+// Wired-Feel Transient Haptic Synthesis Engine for DualSense & 3rd-Party Clones
 // ============================================================================
 static float synth_lp1 = 0.0f;
 static float synth_lp2 = 0.0f;
-static float synth_last_high = 0.0f;
+static float synth_last_mono = 0.0f;
 static float synth_env_bass = 0.0f;
 static float synth_env_high = 0.0f;
 static uint8_t synth_last_sent_right = 0;
@@ -1194,10 +1194,12 @@ static uint8_t synth_last_sent_left = 0;
 static uint32_t synth_last_send_time_us = 0;
 static uint32_t synth_last_audio_activity_us = 0;
 
+constexpr float NOISE_GATE = 0.035f;
+
 static void haptic_synthesis_reset() {
     synth_lp1 = 0.0f;
     synth_lp2 = 0.0f;
-    synth_last_high = 0.0f;
+    synth_last_mono = 0.0f;
     synth_env_bass = 0.0f;
     synth_env_high = 0.0f;
     synth_last_sent_right = 0;
@@ -1213,11 +1215,10 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
 
     const uint32_t now = time_us_32();
     float frame_peak_bass = 0.0f;
-    float frame_peak_high = 0.0f;
     float frame_max_transient = 0.0f;
 
-    // 2-pole low-pass filter at ~130 Hz (sample rate = 3000 Hz, alpha = 0.214f)
-    constexpr float kAlpha = 0.214f;
+    // 2-pole low-pass filter at ~90 Hz (sample rate = 3000 Hz, alpha = 0.158f)
+    constexpr float kAlpha = 0.158f;
 
     const int pairs = sample_bytes / 2;
     for (int i = 0; i < pairs; ++i) {
@@ -1228,80 +1229,86 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         // Quadraphonic native haptics: average both channels to form mono tactile signal
         float mono = 0.5f * (l + r);
 
-        // 2-pole low-pass filter for bass rumble isolation
+        // 2-pole low-pass filter for heavy bass rumble isolation
         synth_lp1 += kAlpha * (mono - synth_lp1);
         synth_lp2 += kAlpha * (synth_lp1 - synth_lp2);
 
         float bass = synth_lp2;
-        float high = mono - synth_lp2;
-
         float abs_bass = fabsf(bass);
-        float abs_high = fabsf(high);
-
         if (abs_bass > frame_peak_bass) frame_peak_bass = abs_bass;
-        if (abs_high > frame_peak_high) frame_peak_high = abs_high;
 
-        // Transient edge detector: sudden change in high-frequency content
-        float d_high = fabsf(high - synth_last_high);
-        if (d_high > frame_max_transient) frame_max_transient = d_high;
-        synth_last_high = high;
+        // Transient onset edge detector: sudden change in mono amplitude
+        float d_mono = fabsf(mono - synth_last_mono);
+        if (d_mono > frame_max_transient) frame_max_transient = d_mono;
+        synth_last_mono = mono;
     }
 
-    // Blend high peak with transient impact for sharp tactile click punch
-    float effective_high = fmaxf(frame_peak_high, frame_max_transient * 1.6f);
+    // Gate out low-level ambient noise (wind, city hum, dialogue)
+    if (frame_peak_bass < NOISE_GATE) frame_peak_bass = 0.0f;
+    float effective_transient = (frame_max_transient >= 0.040f) ? frame_max_transient : 0.0f;
 
-    // Track active audio
-    if (effective_high > 0.005f || frame_peak_bass > 0.005f) {
+    if (effective_transient > 0.0f || frame_peak_bass > 0.0f) {
         synth_last_audio_activity_us = now;
     }
 
-    // Envelope followers:
-    // 1. High frequency / clicks (Right Motor - Light / Fast):
-    // Instant attack for razor-sharp transient clicks
-    if (effective_high > synth_env_high) {
-        synth_env_high = effective_high;
+    // 1. Right Motor (Light / Fast Actuator): Instant strike & ultra-fast decay
+    if (effective_transient > synth_env_high) {
+        synth_env_high = effective_transient;
     } else {
-        // Fast decay: drops to 30% per 10.6ms frame (~8ms half-life)
-        synth_env_high *= 0.30f;
-        if (synth_env_high < 0.005f) synth_env_high = 0.0f;
+        // Drop 85% per 10.6ms frame (~4ms decay)
+        synth_env_high *= 0.15f;
+        if (synth_env_high < 0.040f) synth_env_high = 0.0f;
     }
 
-    // 2. Bass rumble (Left Motor - Heavy / Slow):
-    // Smooth attack ramp for deep weight without mechanical click
+    // 2. Left Motor (Heavy / Slow Actuator): Smooth punch & resonant decay
     if (frame_peak_bass > synth_env_bass) {
-        synth_env_bass = 0.4f * synth_env_bass + 0.6f * frame_peak_bass;
+        synth_env_bass = 0.3f * synth_env_bass + 0.7f * frame_peak_bass;
         if (frame_peak_bass > synth_env_bass) synth_env_bass = frame_peak_bass;
     } else {
-        // Resonant decay: drops to 70% per 10.6ms frame (~30ms half-life)
-        synth_env_bass *= 0.70f;
-        if (synth_env_bass < 0.005f) synth_env_bass = 0.0f;
+        synth_env_bass *= 0.55f;
+        if (synth_env_bass < NOISE_GATE) synth_env_bass = 0.0f;
     }
 
-    // Perceptual Mapping (Zero Deadzone):
-    // Controllers have static friction below PWM ~24.
-    // Map normalized signal [0.006 .. 1.0] to [24 .. 255] using power curve 0.65
-    auto map_motor = [](float env) -> uint8_t {
-        if (env < 0.006f) return 0;
-        float norm = (env - 0.006f) / (1.0f - 0.006f);
+    // Perceptual Mapping:
+    // Right Motor (High-transient clicks / impacts):
+    auto map_right_motor = [](float env) -> uint8_t {
+        if (env < 0.040f) return 0;
+        float norm = (env - 0.040f) / (1.0f - 0.040f);
         if (norm > 1.0f) norm = 1.0f;
-        constexpr float MIN_PWM = 24.0f;
-        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 0.65f);
+        constexpr float MIN_PWM = 32.0f;
+        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 0.70f);
         if (pwm > 255.0f) pwm = 255.0f;
         return static_cast<uint8_t>(pwm + 0.5f);
     };
 
-    uint8_t motor_right = map_motor(synth_env_high);
-    uint8_t motor_left  = map_motor(synth_env_bass);
+    // Left Motor (Deep sub-bass rumble):
+    auto map_left_motor = [](float env) -> uint8_t {
+        if (env < NOISE_GATE) return 0;
+        float norm = (env - NOISE_GATE) / (1.0f - NOISE_GATE);
+        if (norm > 1.0f) norm = 1.0f;
+        constexpr float MIN_PWM = 30.0f;
+        float pwm = MIN_PWM + (255.0f - MIN_PWM) * powf(norm, 0.75f);
+        if (pwm > 255.0f) pwm = 255.0f;
+        return static_cast<uint8_t>(pwm + 0.5f);
+    };
 
-    // Pacing and transmission to controller
-    // If motor values changed, or if non-zero and interval elapsed (>= 5ms),
-    // or if both went to zero (instant stop), submit report!
+    uint8_t motor_right = map_right_motor(synth_env_high);
+    uint8_t motor_left  = map_left_motor(synth_env_bass);
+
+    bool is_zero = ((motor_right | motor_left) == 0);
+    bool was_zero = ((synth_last_sent_right | synth_last_sent_left) == 0);
     bool changed = (motor_right != synth_last_sent_right || motor_left != synth_last_sent_left);
     uint32_t elapsed_us = now - synth_last_send_time_us;
 
-    if (changed || ((motor_right | motor_left) != 0 && elapsed_us >= 5000)) {
-        // Enforce minimum gap of 3.5ms between reports unless stopping immediately
-        if (elapsed_us >= 3500 || ((motor_right | motor_left) == 0 && changed)) {
+    if (is_zero && !was_zero) {
+        // Immediate active stop / braking (zero latency)
+        synth_last_sent_right = 0;
+        synth_last_sent_left = 0;
+        synth_last_send_time_us = now;
+        bt_submit_haptic_synthesis(0, 0);
+    } else if (!is_zero) {
+        // If changed, send if at least 3.5ms elapsed. If unchanged, refresh every 10ms.
+        if ((changed && elapsed_us >= 3500) || elapsed_us >= 10000) {
             synth_last_sent_right = motor_right;
             synth_last_sent_left = motor_left;
             synth_last_send_time_us = now;
@@ -1312,7 +1319,7 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
 
 static void haptic_synthesis_loop(uint32_t now) {
     if ((synth_last_sent_right > 0 || synth_last_sent_left > 0) &&
-        (now - synth_last_audio_activity_us > 25000)) {
+        (now - synth_last_audio_activity_us > 18000)) {
         synth_env_high = 0.0f;
         synth_env_bass = 0.0f;
         synth_last_sent_right = 0;
