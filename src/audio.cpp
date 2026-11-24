@@ -1182,33 +1182,40 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 }
 
 // ============================================================================
-// Tactile Impact Kick Engine (Haptic Overdrive for DualSense Clones)
+// Taptic Kick Transient Impulse Engine (High-Impact Discrete Haptics)
 // ============================================================================
-static uint32_t kick_end_time_left_us = 0;
-static uint32_t kick_end_time_right_us = 0;
-static uint8_t kick_pwm_left = 0;
-static uint8_t kick_pwm_right = 0;
-static float synth_last_left = 0.0f;
-static float synth_last_right = 0.0f;
-static uint8_t synth_last_sent_right = 0;
-static uint8_t synth_last_sent_left = 0;
-static uint32_t synth_last_send_time_us = 0;
+// Designed specifically for voice-coil controllers (Cosmic Byte Sensa / PS5_JG11).
+// Instead of continuous buzzing, it fires sharp 14-18ms full-power (255 PWM) strokes
+// on sudden audio impact edges, followed by immediate active braking and an 80ms
+// refractory silence window so each impact feels like a crisp physical THUD / SNAP.
+// ============================================================================
+static uint32_t taptic_pulse_end_left_us = 0;
+static uint32_t taptic_pulse_end_right_us = 0;
+static uint32_t taptic_refractory_end_left_us = 0;
+static uint32_t taptic_refractory_end_right_us = 0;
 
-// Ambient noise gate: 0.18f (18% amplitude).
-// Ambient city hum and wind stay below 18% (100% silent).
-// Impacts (web shoots, punches, footsteps, landings) trigger full-power overdrive kicks.
-constexpr float NOISE_GATE = 0.18f;
+static float taptic_last_sample_left = 0.0f;
+static float taptic_last_sample_right = 0.0f;
+static uint8_t taptic_last_sent_right = 0;
+static uint8_t taptic_last_sent_left = 0;
+static uint32_t taptic_last_send_time_us = 0;
+
+// Dynamic transient threshold:
+// Ambient wind, city rumble, and soundtrack in Spider-Man stay below 20% amplitude
+// and have low attack slew rate (< 0.20 delta).
+// Real mechanical impacts (punches, landings, web-shoots) spike steeply (delta >= 0.28).
+constexpr float TAPTIC_ATTACK_THRESHOLD = 0.28f;
 
 static void haptic_synthesis_reset() {
-    kick_end_time_left_us = 0;
-    kick_end_time_right_us = 0;
-    kick_pwm_left = 0;
-    kick_pwm_right = 0;
-    synth_last_left = 0.0f;
-    synth_last_right = 0.0f;
-    synth_last_sent_right = 0;
-    synth_last_sent_left = 0;
-    synth_last_send_time_us = 0;
+    taptic_pulse_end_left_us = 0;
+    taptic_pulse_end_right_us = 0;
+    taptic_refractory_end_left_us = 0;
+    taptic_refractory_end_right_us = 0;
+    taptic_last_sample_left = 0.0f;
+    taptic_last_sample_right = 0.0f;
+    taptic_last_sent_right = 0;
+    taptic_last_sent_left = 0;
+    taptic_last_send_time_us = 0;
 }
 
 static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_bytes) {
@@ -1217,88 +1224,85 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     }
 
     const uint32_t now = time_us_32();
-    float frame_peak_left = 0.0f;
-    float frame_peak_right = 0.0f;
-    float frame_transient_left = 0.0f;
-    float frame_transient_right = 0.0f;
+    float max_attack_left = 0.0f;
+    float max_attack_right = 0.0f;
+    float peak_amp_left = 0.0f;
+    float peak_amp_right = 0.0f;
 
     const int pairs = sample_bytes / 2;
     for (int i = 0; i < pairs; ++i) {
-        // Channel 3 = Left Actuator, Channel 4 = Right Actuator
+        // Channel 3 = Left Actuator (Heavy voice coil), Channel 4 = Right Actuator (Light voice coil)
         float l = static_cast<float>(samples[i * 2]) / 127.0f;
         float r = static_cast<float>(samples[i * 2 + 1]) / 127.0f;
 
         float abs_l = fabsf(l);
         float abs_r = fabsf(r);
-        if (abs_l > frame_peak_left) frame_peak_left = abs_l;
-        if (abs_r > frame_peak_right) frame_peak_right = abs_r;
+        if (abs_l > peak_amp_left) peak_amp_left = abs_l;
+        if (abs_r > peak_amp_right) peak_amp_right = abs_r;
 
-        // Transient onset edge detection: captures sudden sharp mechanical clicks/hits
-        float dl = fabsf(l - synth_last_left);
-        float dr = fabsf(r - synth_last_right);
-        if (dl > frame_transient_left) frame_transient_left = dl;
-        if (dr > frame_transient_right) frame_transient_right = dr;
+        // Attack slew rate (rate of change between consecutive audio samples)
+        float delta_l = fabsf(l - taptic_last_sample_left);
+        float delta_r = fabsf(r - taptic_last_sample_right);
+        if (delta_l > max_attack_left) max_attack_left = delta_l;
+        if (delta_r > max_attack_right) max_attack_right = delta_r;
 
-        synth_last_left = l;
-        synth_last_right = r;
+        taptic_last_sample_left = l;
+        taptic_last_sample_right = r;
     }
 
-    // Combine peak magnitude and transient edge punch
-    float strike_left  = fmaxf(frame_peak_left, frame_transient_left * 1.5f);
-    float strike_right = fmaxf(frame_peak_right, frame_transient_right * 1.5f);
+    // Combine absolute peak and attack velocity for punchy transient detection
+    float impact_score_left  = fmaxf(peak_amp_left * 0.75f, max_attack_left * 1.5f);
+    float impact_score_right = fmaxf(peak_amp_right * 0.75f, max_attack_right * 1.5f);
 
-    // Left Channel Haptic Overdrive Kick Trigger (Heavy weight / Deep Thud)
-    if (strike_left >= NOISE_GATE) {
-        // Overdrive pulse: full torque kick to break motor inertia and create a real physical THUD
-        uint32_t pulse_duration_us = (strike_left > 0.40f) ? 38000 : 24000;
-        kick_end_time_left_us = now + pulse_duration_us;
-        kick_pwm_left = (strike_left > 0.40f) ? 255 : 210;
+    // --- Left Actuator Trigger (Heavy Body Impacts, Landings, Punches) ---
+    // Only trigger if outside refractory window (prevents blurring into continuous buzz)
+    if (impact_score_left >= TAPTIC_ATTACK_THRESHOLD && time_reached(now, taptic_refractory_end_left_us)) {
+        // 18ms pulse: single heavy mechanical stroke of the voice coil
+        taptic_pulse_end_left_us = now + 18000;
+        // 85ms refractory period: enforces crisp silence before the next impact
+        taptic_refractory_end_left_us = now + 85000;
     }
 
-    // Right Channel Haptic Overdrive Kick Trigger (Light weight / Sharp Snap)
-    if (strike_right >= NOISE_GATE) {
-        uint32_t pulse_duration_us = (strike_right > 0.40f) ? 30000 : 18000;
-        kick_end_time_right_us = now + pulse_duration_us;
-        kick_pwm_right = (strike_right > 0.40f) ? 255 : 200;
+    // --- Right Actuator Trigger (Fast Transients, Web Shoots, Clicks, Snaps) ---
+    if (impact_score_right >= TAPTIC_ATTACK_THRESHOLD && time_reached(now, taptic_refractory_end_right_us)) {
+        // 14ms pulse: ultra-fast snappy click of the light voice coil
+        taptic_pulse_end_right_us = now + 14000;
+        // 75ms refractory period: keeps consecutive web shoots snappy and discrete
+        taptic_refractory_end_right_us = now + 75000;
     }
 
-    uint8_t motor_left = 0;
-    uint8_t motor_right = 0;
+    // Evaluate active pulse states
+    uint8_t motor_left  = (!time_reached(now, taptic_pulse_end_left_us))  ? 255 : 0;
+    uint8_t motor_right = (!time_reached(now, taptic_pulse_end_right_us)) ? 255 : 0;
 
-    if (!time_reached(now, kick_end_time_left_us)) {
-        motor_left = kick_pwm_left;
-    }
-    if (!time_reached(now, kick_end_time_right_us)) {
-        motor_right = kick_pwm_right;
-    }
-
-    bool is_zero = ((motor_right | motor_left) == 0);
-    bool was_zero = ((synth_last_sent_right | synth_last_sent_left) == 0);
-    bool changed = (motor_right != synth_last_sent_right || motor_left != synth_last_sent_left);
-    uint32_t elapsed_us = now - synth_last_send_time_us;
+    bool is_zero  = ((motor_right | motor_left) == 0);
+    bool was_zero = ((taptic_last_sent_right | taptic_last_sent_left) == 0);
+    bool changed  = (motor_right != taptic_last_sent_right || motor_left != taptic_last_sent_left);
+    uint32_t elapsed_us = now - taptic_last_send_time_us;
 
     if (is_zero && !was_zero) {
-        // Immediate active stop / braking (zero latency)
-        synth_last_sent_right = 0;
-        synth_last_sent_left = 0;
-        synth_last_send_time_us = now;
+        // Immediate active braking: cuts power immediately to prevent coil drag/ringing
+        taptic_last_sent_right = 0;
+        taptic_last_sent_left = 0;
+        taptic_last_send_time_us = now;
         bt_submit_haptic_synthesis(0, 0);
     } else if (!is_zero) {
-        if ((changed && elapsed_us >= 3500) || elapsed_us >= 10000) {
-            synth_last_sent_right = motor_right;
-            synth_last_sent_left = motor_left;
-            synth_last_send_time_us = now;
+        // Instant pulse dispatch
+        if (changed || elapsed_us >= 8000) {
+            taptic_last_sent_right = motor_right;
+            taptic_last_sent_left = motor_left;
+            taptic_last_send_time_us = now;
             bt_submit_haptic_synthesis(motor_right, motor_left);
         }
     }
 }
 
 static void haptic_synthesis_loop(uint32_t now) {
-    if ((synth_last_sent_right > 0 || synth_last_sent_left > 0) &&
-        time_reached(now, kick_end_time_left_us) && time_reached(now, kick_end_time_right_us)) {
-        synth_last_sent_right = 0;
-        synth_last_sent_left = 0;
-        synth_last_send_time_us = now;
+    if ((taptic_last_sent_right > 0 || taptic_last_sent_left > 0) &&
+        time_reached(now, taptic_pulse_end_left_us) && time_reached(now, taptic_pulse_end_right_us)) {
+        taptic_last_sent_right = 0;
+        taptic_last_sent_left = 0;
+        taptic_last_send_time_us = now;
         bt_submit_haptic_synthesis(0, 0);
     }
 }
