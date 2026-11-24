@@ -5740,6 +5740,12 @@ void bt_submit_haptic_synthesis(uint8_t right, uint8_t left) {
         right,
         left
     );
+    // Guarantee both CompatibleVibration and HapticsSelect flags
+    // so both 3rd-party clone MCUs and genuine Sony DualSense pads actuate.
+    report[3 + ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
+    if ((right | left) != 0) {
+        report[3 + ds5::output::kValidFlag2Offset] |= ds5::output::kFlag2EnableImprovedRumbleEmulation;
+    }
     bt_write(report, sizeof(report));
 }
 
