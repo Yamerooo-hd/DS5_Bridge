@@ -5740,7 +5740,6 @@ void bt_submit_haptic_synthesis(uint8_t right, uint8_t left) {
         right,
         left
     );
-    apply_classic_rumble_gain(report, sizeof(report));
     bt_write(report, sizeof(report));
 }
 
