@@ -1330,11 +1330,11 @@ static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) 
     pkt32[3] = 0x07;
     pkt32[4] = 0xFE;
     for (int i = 5; i <= 9; ++i) {
-        pkt32[i] = 64; // ControllerQueueFrames
+        pkt32[i] = 16; // ControllerQueueFrames (16 frames per official Sony spec)
     }
     pkt32[10] = haptic_0x32_counter++;
     pkt32[11] = 0x92;
-    pkt32[12] = 64; // SamplesBytes (32 stereo samples at 3 kHz)
+    pkt32[12] = 0x40; // 64 bytes (32 stereo samples at 3 kHz)
     memcpy(pkt32 + 13, samples, 64);
 
 #ifdef ENABLE_COMPANION
@@ -1403,7 +1403,7 @@ static void process_bridge_audio_frame(uint8_t const *frame) {
     }
     int8_t haptic_buf[SAMPLE_SIZE]{};
     memcpy(haptic_buf, frame, SAMPLE_SIZE);
-    haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
+    // haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
     if (send_audio_haptics_packet(haptic_buf, speaker_route_active, false)) {
         last_audio_us = time_us_32();
     }
@@ -2028,7 +2028,7 @@ void audio_test_haptics_loop() {
     int8_t haptic_buf[SAMPLE_SIZE]{};
     if (merge_test_haptics_overlay(haptic_buf, false)) {
         note_audio_haptics_producer_frame(time_us_32());
-        haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
+        // haptic_synthesis_process_buffer(haptic_buf, SAMPLE_SIZE);
         send_haptic_report_0x32(haptic_buf);
     }
 }
@@ -2142,7 +2142,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
-            haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
+            // haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
             if (speaker_route_demanded) {
                 send_audio_haptics_packet(audio_haptic_buf, true);
             } else {
