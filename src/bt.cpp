@@ -465,6 +465,8 @@ static uint16_t hid_interrupt_pending_cid;
 static bt_data_callback_t bt_data_callback = nullptr;
 static uint8_t controller_type = ControllerTypeUnknown;
 static bool controller_type_check_pending = false;
+static uint8_t haptic_synth_active_right = 0;
+static uint8_t haptic_synth_active_left = 0;
 static bool hid_control_ready = false;
 static bool hid_interrupt_ready = false;
 static HidConnectionInitiator hid_connection_initiator = HidConnectionInitiator::None;
@@ -3744,6 +3746,8 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             clear_feature_prefetch_queue();
             controller_type = ControllerTypeUnknown;
             controller_type_check_pending = false;
+            haptic_synth_active_right = 0;
+            haptic_synth_active_left = 0;
             hid_channel_recovery_pending = false;
             hid_channel_recovery_attempts = 0;
             critical_section_enter_blocking(&queue_lock);
@@ -5468,6 +5472,20 @@ bool bt_write_classified_output(uint8_t *data, uint16_t len) {
         payload_len,
         audio_haptics_session_active()
     );
+    // Do not allow frequent host USB 0x02 updates (e.g. adaptive triggers sending motor=0)
+    // to overwrite or kill an active synthesized haptic kick mid-pulse.
+    if (
+        (haptic_synth_active_right | haptic_synth_active_left) != 0
+        && payload_len > ds5::output::kMotorLeftOffset
+        && (payload[ds5::output::kMotorRightOffset] | payload[ds5::output::kMotorLeftOffset]) == 0
+    ) {
+        payload[ds5::output::kMotorRightOffset] = haptic_synth_active_right;
+        payload[ds5::output::kMotorLeftOffset] = haptic_synth_active_left;
+        payload[ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
+        if (payload_len > ds5::output::kValidFlag2Offset) {
+            payload[ds5::output::kValidFlag2Offset] |= ds5::output::kFlag2EnableImprovedRumbleEmulation;
+        }
+    }
     apply_player_led_policy_to_payload(payload, payload_len);
 
     uint8_t trace_critical_depth = 0;
@@ -5728,6 +5746,8 @@ void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len) {
 }
 
 void bt_submit_haptic_synthesis(uint8_t right, uint8_t left) {
+    haptic_synth_active_right = right;
+    haptic_synth_active_left = left;
     if (hid_interrupt_cid == 0) {
         return;
     }
