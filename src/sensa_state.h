@@ -41,7 +41,7 @@ struct DspConfig {
     uint16_t decay_ms = 55;            // Decay window after hold
     bool include_speaker_bass = true;  // Fold ch0/ch1 sub-bass transients subtly when ch3/4 present or strong explosion
     uint16_t speaker_bass_pct = 20;    // 0..100% weight of low-freq speaker energy above 25% threshold
-    uint8_t haptic_gain_pct = 100;     // PCM waveform scale for 0x32 / 0x36 (50..300%)
+    uint8_t haptic_gain_pct = 150;     // PCM waveform scale for 0x36/0x39 (ds5-untethered default 1.5x + tanh)
 };
 
 struct HostOutputState {

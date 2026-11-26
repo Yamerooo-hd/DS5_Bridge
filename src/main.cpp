@@ -16,7 +16,7 @@
 
 namespace sensa {
 
-HapticMode g_haptic_mode = HapticMode::Mode31Synth;
+HapticMode g_haptic_mode = HapticMode::Mode36Haptics;
 DspConfig g_dsp_config{};
 Telemetry g_telemetry{};
 HostOutputState g_host_output{};

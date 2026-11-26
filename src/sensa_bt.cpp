@@ -37,6 +37,7 @@ uint16_t hid_intr_pending = 0;
 bool hid_ctrl_ready = false;
 bool hid_intr_ready = false;
 bool hid_session_announced = false;
+bool rx_0x31_seen = false;
 bool security_ready = false;
 
 bool pairing_window = false;
@@ -304,15 +305,8 @@ void sdp_callback(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16
     }
 }
 
-void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_haptics_select) {
-    std::memset(out_pkt, 0, 79);
-    out_pkt[0] = 0xA2;
-    uint8_t *r = out_pkt + 1;
-    r[0] = 0x31;
-    r[1] = static_cast<uint8_t>((bt_seq_nibble++ & 0x0Fu) << 4);
-    r[2] = 0x10; // BT output tag
-
-    uint8_t *p = r + 3;
+// Populate common 47-byte/63-byte DualSense output block shared by 0x31 and 0x90 subpacket in 0x36/0x39
+void fill_state_block(uint8_t p[63], bool allow_synth_motors, bool haptics_audio_mode) {
     if (g_host_output.valid && g_host_output.len > 0) {
         uint16_t n = std::min<uint16_t>(g_host_output.len, 47);
         std::memcpy(p, g_host_output.payload, n);
@@ -334,10 +328,14 @@ void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_
         if (synth_l > out_l) out_l = synth_l;
     }
 
-    if (clear_haptics_select) {
+    if (haptics_audio_mode) {
+        // ds5-untethered SetHapticsMode: clear rumble bits, enable PowerSaveControl|HapticsLowPass|MotorPowerControl (0x62)
         p[0] &= static_cast<uint8_t>(~(0x01u | 0x02u));
+        p[1] |= 0x62u;
         p[2] = 0;
         p[3] = 0;
+        p[9] = 0;  // PowerSave = 0
+        p[36] = 0; // MotorPowerReduction = 0
     } else if ((out_r | out_l) != 0) {
         p[0] |= 0x03u; // CompatibleVibration | HapticsSelect
         p[2] = out_r;
@@ -352,15 +350,9 @@ void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_
     g_telemetry.last_sent_right = p[2];
     g_telemetry.last_sent_left = p[3];
 
-    // --- Mic Mute LED: always drive to OFF unless explicitly set by USB host ---
-    // Byte p[0] bit0 = CompatibleVibration, bit1 = HapticsSelect,
-    // Byte p[1] bit0 = MicMuteLedControlEnable (Flag1 bit0).
-    // The raw USB 0x02 output often has MicMuteLedControlEnable=1 and mute_led=1 (p[8])
-    // which forces the mic LED on. We always clamp it here: LED control enabled = yes
-    // (so we can explicitly drive it), but mute_led value = 0 (OFF) unless a future
-    // explicit "mic mute ON" command sets an internal flag.
-    p[1] |= 0x01u;  // MicMuteLedControlEnable: tell controller we are controlling it
-    p[8] = 0x00;    // mute_led_mode = off (not muted = LED off)
+    // Mic Mute LED: keep OFF unless explicitly handled
+    p[1] |= 0x01u; // MicMuteLedControlEnable
+    p[8] = 0x00;   // Mute LED off
 
     if (led_override_active) {
         p[1] |= 0x04u; // Lightbar control enable
@@ -368,7 +360,16 @@ void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_
         p[45] = led_override_g;
         p[46] = led_override_b;
     }
+}
 
+void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_haptics_select) {
+    std::memset(out_pkt, 0, 79);
+    out_pkt[0] = 0xA2;
+    uint8_t *r = out_pkt + 1;
+    r[0] = 0x31;
+    r[1] = static_cast<uint8_t>((bt_seq_nibble++ & 0x0Fu) << 4);
+    r[2] = 0x10; // BT output tag
+    fill_state_block(r + 3, allow_synth_motors, clear_haptics_select);
     write_bt_report_crc(r, 78);
 }
 
@@ -377,9 +378,9 @@ void build_0x32_packet(uint8_t out_pkt[143], int8_t const haptics[64]) {
     out_pkt[0] = 0xA2;
     uint8_t *r = out_pkt + 1;
     r[0] = 0x32;
-    r[1] = 0x00;
+    r[1] = static_cast<uint8_t>((bt_seq_nibble++ & 0x0Fu) << 4);
     r[2] = 0x91; r[3] = 0x07;
-    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0xFF;
+    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0x20;
     r[10] = bt_audio_ctr++;
     r[11] = 0x92; r[12] = 64;
     std::memcpy(r + 13, haptics, 64);
@@ -393,12 +394,12 @@ void build_0x36_packet(uint8_t out_pkt[399], int8_t const haptics[64]) {
     r[0] = 0x36;
     r[1] = static_cast<uint8_t>((bt_seq_nibble++ & 0x0Fu) << 4);
     r[2] = 0x91; r[3] = 0x07;
-    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0xFF;
+    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0x20;
     r[10] = bt_audio_ctr++;
-    r[11] = 0x90; r[12] = 63; // 0x10|0x80 state (zeros so HapticsSelect stays 0)
-    r[76] = 0x92; r[77] = 64; // 0x12|0x80 haptics
+    r[11] = 0x90; r[12] = 63;
+    fill_state_block(r + 13, false, true);
+    r[76] = 0x92; r[77] = 64;
     std::memcpy(r + 78, haptics, 64);
-    r[142] = 0x93; r[143] = 200; // 0x13|0x80 speaker Opus slot (zeroed silence)
     write_bt_report_crc(r, 398);
 }
 
@@ -409,12 +410,12 @@ void build_0x39_packet(uint8_t out_pkt[548], int8_t const haptics[64]) {
     r[0] = 0x39;
     r[1] = static_cast<uint8_t>((bt_seq_nibble++ & 0x0Fu) << 4);
     r[2] = 0x91; r[3] = 0x07;
-    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0xFF;
+    r[4] = 0xFE; r[5] = 0x00; r[6] = 0x00; r[7] = 0x00; r[8] = 0x00; r[9] = 0x20;
     r[10] = bt_audio_ctr++;
     r[11] = 0x90; r[12] = 63;
+    fill_state_block(r + 13, false, true);
     r[76] = 0x92; r[77] = 64;
     std::memcpy(r + 78, haptics, 64);
-    r[142] = 0x93; r[143] = 200;
     write_bt_report_crc(r, 547);
 }
 
@@ -454,6 +455,7 @@ void reset_session_state() {
     hid_ctrl_ready = false;
     hid_intr_ready = false;
     hid_session_announced = false;
+    rx_0x31_seen = false;
     security_ready = false;
     intr_can_send_req = false;
     ctrl_can_send_req = false;
@@ -489,6 +491,7 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
     if (packet_type == L2CAP_DATA_PACKET) {
         if (channel == hid_intr_cid && size > 2) {
             if (packet[1] == 0x31 && (packet[2] & 0x02u) == 0 && size >= 66) {
+                rx_0x31_seen = true;
                 g_telemetry.bt_0x31_rx_count++;
                 usb_submit_bt_input_report(packet + 3, 63);
             } else if (packet[1] == 0x01 && size >= 11) {
@@ -504,6 +507,11 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             if ((hdr & 0xF0u) == 0xA0u && size >= 3) {
                 store_feature(packet[1], packet + 1, static_cast<uint16_t>(size - 1));
                 console_printf("[BT] Cached Feature 0x%02X (%u bytes)\n", packet[1], size - 1);
+                if (packet[1] == 0x05) {
+                    // Sensa requires a 0x31 SetHapticsMode output after Feature 0x05 to switch into full 0x31 input reports
+                    state_send_pending = true;
+                    request_intr_tx();
+                }
             }
             return;
         }
@@ -548,10 +556,14 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                     build_0x36_packet(buf, pending_audio_block);
                     len = 399;
                     g_telemetry.bt_0x36_tx_count++;
+                    state_send_pending = false; // 0x36 carries full 0x90 state
+                    last_state_send_us = time_us_32();
                 } else if (pending_audio_proto == HapticMode::Mode39Probe) {
                     build_0x39_packet(buf, pending_audio_block);
                     len = 548;
                     g_telemetry.bt_0x39_tx_count++;
+                    state_send_pending = false; // 0x39 carries full 0x90 state
+                    last_state_send_us = time_us_32();
                 }
                 if (len > 0) {
                     uint8_t st = l2cap_send(hid_intr_cid, buf, len);
@@ -561,8 +573,10 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 state_send_pending = false;
                 uint8_t pkt79[79];
                 bool synth = (g_haptic_mode == HapticMode::Mode31Synth);
-                bool no_haptics_sel = (g_haptic_mode == HapticMode::Mode31Hybrid32);
-                build_0x31_packet(pkt79, synth, no_haptics_sel);
+                bool haptics_mode_0x31 = !rx_0x31_seen ||
+                                         (g_haptic_mode == HapticMode::Mode31Hybrid32) ||
+                                         ((g_haptic_mode == HapticMode::Mode36Haptics || g_haptic_mode == HapticMode::Mode39Probe) && dsp_is_haptics_active());
+                build_0x31_packet(pkt79, synth, haptics_mode_0x31);
                 uint8_t st = l2cap_send(hid_intr_cid, pkt79, sizeof(pkt79));
                 if (st == 0) {
                     g_telemetry.bt_0x31_tx_count++;
@@ -975,16 +989,24 @@ void bt_poll() {
 
     if (!hid_intr_ready) return;
 
-    // Pull next 64B DSP waveform block when ready
-    int8_t block[64];
-    HapticMode wave_proto = g_haptic_mode;
-    if (dsp_take_haptic_block(block, wave_proto)) {
-        if (wave_proto == HapticMode::Mode32SAxense ||
-            wave_proto == HapticMode::Mode36Haptics ||
-            wave_proto == HapticMode::Mode39Probe ||
-            wave_proto == HapticMode::Mode31Hybrid32) {
-            bt_submit_haptic_waveform(block, wave_proto);
+    // Pull next 64B DSP waveform block once 0x31 mode is unlocked
+    if (rx_0x31_seen) {
+        int8_t block[64];
+        HapticMode wave_proto = g_haptic_mode;
+        if (dsp_take_haptic_block(block, wave_proto)) {
+            if (wave_proto == HapticMode::Mode32SAxense ||
+                wave_proto == HapticMode::Mode36Haptics ||
+                wave_proto == HapticMode::Mode39Probe ||
+                wave_proto == HapticMode::Mode31Hybrid32) {
+                bt_submit_haptic_waveform(block, wave_proto);
+            }
         }
+    }
+
+    // Retry 0x31 SetHapticsMode unlock until full 0x31 input reports arrive
+    if (!rx_0x31_seen && static_cast<uint32_t>(now_us - last_state_send_us) >= 400000u) {
+        state_send_pending = true;
+        request_intr_tx();
     }
 
     // Periodic 0x31 update at ~100 Hz while rumble active (or hybrid trigger updates)

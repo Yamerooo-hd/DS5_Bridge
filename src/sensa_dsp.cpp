@@ -15,16 +15,20 @@ constexpr uint32_t kUsbReadChunkFrames = 48; // 1 ms @ 48 kHz
 int16_t usb_pcm_rx[kUsbReadChunkFrames * 4];
 int16_t usb_mic_zeros[48]{};
 
-// 3 kHz downsampled haptic block (32 L/R int8 pairs = 512 input frames @ 48 kHz = 10.67 ms)
-int8_t building_block[64]{};
+// 2-stage 1000 Hz IIR low-pass (matching ds5-untethered HapticsConverter.cs) + 3 kHz downsampling
+constexpr float kLpfAlpha = 0.1227f; // 1 - exp(-2*pi*1000/48000)
+float lpf1_l = 0.0f, lpf2_l = 0.0f;
+float lpf1_r = 0.0f, lpf2_r = 0.0f;
+float decimate_sum_l = 0.0f;
+float decimate_sum_r = 0.0f;
+uint8_t building_block[64]{};
 uint8_t building_pair_idx = 0;
 uint8_t decimate_accum_count = 0;
-int32_t decimate_sum_l = 0;
-int32_t decimate_sum_r = 0;
 
 int8_t ready_block[64]{};
 bool ready_block_valid = false;
 uint32_t last_wave_block_us = 0;
+uint32_t last_haptic_sound_us = 0;
 
 // Peak telemetry (1000 = 100.0%, i.e., tenths of percent)
 uint16_t cur_peak_audio_l = 0;
@@ -101,21 +105,43 @@ void process_frames(int16_t const *frames, uint32_t count, uint32_t now_us) {
         if (abs_hl > block_max_hl) block_max_hl = abs_hl;
         if (abs_hr > block_max_hr) block_max_hr = abs_hr;
 
-        // Apply user haptic_gain_pct to 3kHz int8 waveform for 0x32 / 0x36 / 0x39
-        int32_t scaled_l = (hl * g_dsp_config.haptic_gain_pct) / 100;
-        int32_t scaled_r = (hr * g_dsp_config.haptic_gain_pct) / 100;
-        decimate_sum_l += scaled_l;
-        decimate_sum_r += scaled_r;
+        // 2-stage 1000 Hz IIR low-pass + 16x decimation -> 3 kHz (ds5-untethered HapticsConverter)
+        if ((hl | hr) != 0 || lpf1_l != 0.0f || lpf2_l != 0.0f || lpf1_r != 0.0f || lpf2_r != 0.0f) {
+            float fl = static_cast<float>(hl) / 32768.0f;
+            float fr = static_cast<float>(hr) / 32768.0f;
+            lpf1_l += kLpfAlpha * (fl - lpf1_l);
+            lpf2_l += kLpfAlpha * (lpf1_l - lpf2_l);
+            lpf1_r += kLpfAlpha * (fr - lpf1_r);
+            lpf2_r += kLpfAlpha * (lpf1_r - lpf2_r);
+            decimate_sum_l += lpf2_l;
+            decimate_sum_r += lpf2_r;
+            if ((hl | hr) == 0) {
+                if (std::fabs(lpf1_l) < 1e-6f) lpf1_l = 0.0f;
+                if (std::fabs(lpf2_l) < 1e-6f) lpf2_l = 0.0f;
+                if (std::fabs(lpf1_r) < 1e-6f) lpf1_r = 0.0f;
+                if (std::fabs(lpf2_r) < 1e-6f) lpf2_r = 0.0f;
+            }
+        }
         decimate_accum_count++;
 
         if (decimate_accum_count >= 16) {
-            int32_t avg_l = (decimate_sum_l / 16) >> 8;
-            int32_t avg_r = (decimate_sum_r / 16) >> 8;
-            push_haptic_pair(clamp_i8(avg_l), clamp_i8(avg_r));
-            decimate_sum_l = 0;
-            decimate_sum_r = 0;
+            int8_t out_l = 0, out_r = 0;
+            if (decimate_sum_l != 0.0f || decimate_sum_r != 0.0f) {
+                float level = static_cast<float>(g_dsp_config.haptic_gain_pct) * 0.01f;
+                float vl = std::tanh((decimate_sum_l / 16.0f) * level) * 127.0f;
+                float vr = std::tanh((decimate_sum_r / 16.0f) * level) * 127.0f;
+                out_l = clamp_i8(static_cast<int32_t>(vl));
+                out_r = clamp_i8(static_cast<int32_t>(vr));
+            }
+            push_haptic_pair(out_l, out_r);
+            decimate_sum_l = 0.0f;
+            decimate_sum_r = 0.0f;
             decimate_accum_count = 0;
         }
+    }
+
+    if (block_max_hl > 16 || block_max_hr > 16) {
+        last_haptic_sound_us = now_us;
     }
 
     auto to_tenths = [](int32_t peak) -> uint16_t {
@@ -235,12 +261,22 @@ void dsp_get_synth_motors(uint8_t &right_out, uint8_t &left_out) {
     left_out = clamp_u8(synth_level_l);
 }
 
+bool dsp_is_haptics_active() {
+    if (test_wave_active) return true;
+    if (!g_telemetry.usb_speaker_streaming || last_haptic_sound_us == 0) return false;
+    return static_cast<uint32_t>(time_us_32() - last_haptic_sound_us) <= 300000u;
+}
+
 bool dsp_take_haptic_block(int8_t out_block[64], HapticMode &override_proto) {
     if (!ready_block_valid) return false;
-    std::memcpy(out_block, ready_block, 64);
     ready_block_valid = false;
-    override_proto = ready_has_override ? ready_override_proto : g_haptic_mode;
+    bool has_override = ready_has_override;
+    override_proto = has_override ? ready_override_proto : g_haptic_mode;
     ready_has_override = false;
+    if (!has_override && !dsp_is_haptics_active()) {
+        return false;
+    }
+    std::memcpy(out_block, ready_block, 64);
     return true;
 }
 
