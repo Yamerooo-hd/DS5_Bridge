@@ -658,6 +658,9 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                            bd_addr_to_str(addr), static_cast<unsigned long>(cod), name_buf);
             // Major Device Class 5 = Peripheral (Gamepads/Controllers)
             if (major == 5) {
+                uint8_t page_rep = gap_event_inquiry_result_get_page_scan_repetition_mode(packet);
+                uint16_t clk_off = gap_event_inquiry_result_get_clock_offset(packet);
+                uint16_t valid_clk = (clk_off != 0) ? static_cast<uint16_t>((clk_off & 0x7FFFu) | 0x8000u) : 0;
                 gap_inquiry_stop();
                 inquiry_active = false;
                 bd_addr_copy(peer_addr, addr);
@@ -665,7 +668,15 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 std::memcpy(g_telemetry.bt_addr, addr, 6);
                 std::memcpy(g_telemetry.bt_name, name_buf, sizeof(g_telemetry.bt_name));
                 outbound_connecting = true;
-                uint8_t st = gap_connect(addr, BD_ADDR_TYPE_ACL);
+                uint8_t st = hci_send_cmd(
+                    &hci_create_connection,
+                    addr,
+                    hci_usable_acl_packet_types(),
+                    page_rep,
+                    0,
+                    valid_clk,
+                    1
+                );
                 console_printf("[BT] Connecting to %s -> status=0x%02X\n", bd_addr_to_str(addr), st);
             }
             break;
@@ -923,7 +934,15 @@ void bt_poll() {
         bd_addr_copy(peer_addr, bonded_addr);
         peer_addr_valid = true;
         outbound_connecting = true;
-        uint8_t st = gap_connect(bonded_addr, BD_ADDR_TYPE_ACL);
+        uint8_t st = hci_send_cmd(
+            &hci_create_connection,
+            bonded_addr,
+            hci_usable_acl_packet_types(),
+            2,
+            0,
+            0,
+            1
+        );
         console_printf("[BT] Auto-connecting bonded %s -> status=0x%02X\n", bd_addr_to_str(bonded_addr), st);
     }
 
