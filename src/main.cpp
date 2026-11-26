@@ -1,1083 +1,127 @@
-//
-// Created by awalol on 2026/3/4.
-// Modified for DS5 Bridge companion firmware and app integration.
-//
+#include "sensa_bt.h"
+#include "sensa_console.h"
+#include "sensa_dsp.h"
+#include "sensa_state.h"
+#include "sensa_usb.h"
 
-#include <algorithm>
-#include <cstdio>
 #include "bsp/board_api.h"
-#include "button_functions.h"
-#include "bt.h"
-#include "controller_input_delivery_queue.h"
-#include "controller_input_receive_batch.h"
-#include "controller_packet_compositor.h"
-#include "controller_output_policy.h"
-#include "controller_output_submit.h"
-#include "utils.h"
-#include "resample.h"
-#include "audio.h"
-#include "usb.h"
-#include "usb_descriptor_mode.h"
-#include "host_input.h"
-#include "wake_on_lan.h"
-#include "controller_report.h"
-#include "dualsense_input_decoder.h"
-#include "dualsense_output.h"
-#include "firmware_log.h"
-#include "persona/ds4_persona.h"
-#include "persona/dualsense_persona.h"
-#include "persona/host_persona.h"
-#include "persona/xusb360_usb.h"
-#include "runtime_fail_fast.h"
-#include "watchdog_telemetry.h"
-#include "hardware/clocks.h"
-#include "hardware/vreg.h"
+#include "hardware/gpio.h"
+#include "hardware/structs/ioqspi.h"
+#include "hardware/structs/sio.h"
 #include "hardware/watchdog.h"
+#include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
+#include "pico/flash.h"
 #include "pico/stdlib.h"
-#include "pico/time.h"
-#include "pico/unique_id.h"
-#ifdef ENABLE_COMPANION
-#include "companion.h"
-#endif
 
-// Pico SDK support for waiting on conditions.
-#include "pico/critical_section.h"
+namespace sensa {
 
-int reportSeqCounter = 0;
-static constexpr uint32_t HOST_LIGHTBAR_RESTORE_DELAY_MS = 3000;
-static constexpr uint32_t HOST_PERSONA_SWITCH_INPUT_FALLBACK_US = 3'000'000;
+HapticMode g_haptic_mode = HapticMode::Mode31Synth;
+DspConfig g_dsp_config{};
+Telemetry g_telemetry{};
+HostOutputState g_host_output{};
 
-enum HidDebugKind : uint8_t {
-    HidDebugGetReport = 1,
-    HidDebugSetReport = 2,
-    HidDebugInputReport = 3,
-};
+namespace {
 
-static uint32_t last_input_debug_us = 0;
-static uint8_t input_debug_burst_remaining = 0;
-
-#if DS5_DEBUG_LOGS_ENABLED
-static constexpr uint32_t AUDIO_TRANSPORT_UART_LOG_INTERVAL_US = 10'000'000u;
-static constexpr uint32_t AUDIO_TRANSPORT_UART_PROBE_INTERVAL_US = 250'000u;
-static constexpr uint32_t AUDIO_TRANSPORT_UART_INITIAL_DELAY_US = 2'500'000u;
-
-struct AudioTransportUartSnapshot {
-    audio_debug_stats audio{};
-    bt_output_debug_stats bt{};
-};
-
-static AudioTransportUartSnapshot audio_transport_uart_previous{};
-static uint32_t audio_transport_uart_next_log_us = 0;
-static uint32_t audio_transport_uart_next_probe_us = 0;
-static bool audio_transport_uart_armed = false;
-
-static uint32_t audio_transport_uart_counter_delta(uint32_t current, uint32_t previous) {
-    return current - previous;
+void __no_inline_not_in_flash_func(read_bootsel_cb)(void *param) {
+    bool *pressed = static_cast<bool *>(param);
+    constexpr uint kCsPin = 1;
+    hw_write_masked(&ioqspi_hw->io[kCsPin].ctrl,
+                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+    for (int i = 0; i < 1000; ++i) __asm volatile("nop");
+    *pressed = !(sio_hw->gpio_hi_in & SIO_GPIO_HI_IN_QSPI_CSN_BITS);
+    hw_write_masked(&ioqspi_hw->io[kCsPin].ctrl,
+                    GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
 }
 
-static void audio_transport_uart_capture(AudioTransportUartSnapshot &snapshot) {
-    audio_debug_get_stats(&snapshot.audio);
-    bt_get_output_debug_stats(&snapshot.bt);
+bool read_bootsel_button() {
+    bool pressed = false;
+    flash_safe_execute(read_bootsel_cb, &pressed, 50);
+    return pressed;
 }
 
-static void audio_transport_uart_log_if_due(uint32_t now) {
-    if (
-        audio_transport_uart_next_probe_us != 0
-        && static_cast<int32_t>(now - audio_transport_uart_next_probe_us) < 0
-    ) {
-        return;
-    }
-    audio_transport_uart_next_probe_us = now + AUDIO_TRANSPORT_UART_PROBE_INTERVAL_US;
+void poll_bootsel_and_led(uint32_t now_us) {
+    static uint32_t last_btn_us = 0;
+    static uint32_t down_since_us = 0;
+    static bool was_down = false;
+    static bool hold_fired = false;
+    static uint8_t click_count = 0;
+    static uint32_t last_click_us = 0;
 
-    if (!audio_recent()) {
-        audio_transport_uart_armed = false;
-        audio_transport_uart_next_log_us = 0;
-        return;
-    }
-
-    if (!audio_transport_uart_armed) {
-        audio_transport_uart_capture(audio_transport_uart_previous);
-        audio_transport_uart_next_log_us = now + AUDIO_TRANSPORT_UART_INITIAL_DELAY_US;
-        audio_transport_uart_armed = true;
-        return;
-    }
-
-    if (static_cast<int32_t>(now - audio_transport_uart_next_log_us) < 0) {
-        return;
-    }
-
-    AudioTransportUartSnapshot current{};
-    audio_transport_uart_capture(current);
-    DS5_LOG(
-        "[AUDUSB] readGap=%lu readLate=%lu genDrop=%lu\n",
-        static_cast<unsigned long>(current.audio.usb_audio_gap_max_us),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.audio.usb_audio_gap_over_1500_count,
-            audio_transport_uart_previous.audio.usb_audio_gap_over_1500_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.audio.audio_generation_drop_count,
-            audio_transport_uart_previous.audio.audio_generation_drop_count
-        ))
-    );
-    DS5_LOG(
-        "[AUDBT] report=0x39 encMax=%lu encLate=%lu enc=%lu ageMax=%lu sendGap=%lu late=%lu drop=%lu qMax=%lu nonAudio=%lu fail=%lu enq=%lu sent=%lu stateRx=%lu stateSent=%lu\n",
-        static_cast<unsigned long>(current.audio.opus_encode_max_us),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.audio.opus_encode_over_budget_count,
-            audio_transport_uart_previous.audio.opus_encode_over_budget_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.audio.opus_encode_count,
-            audio_transport_uart_previous.audio.opus_encode_count
-        )),
-        static_cast<unsigned long>(current.bt.audio_0x36_enqueue_to_send_max_us),
-        static_cast<unsigned long>(current.bt.audio_0x36_send_gap_max_us),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.audio_0x36_late_count_over_12000_us,
-            audio_transport_uart_previous.bt.audio_0x36_late_count_over_12000_us
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.audio_0x36_drop_oldest_count,
-            audio_transport_uart_previous.bt.audio_0x36_drop_oldest_count
-        )),
-        static_cast<unsigned long>(current.bt.bt_audio_queue_depth_max),
-        static_cast<unsigned long>(current.bt.non_audio_reports_between_audio_max),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.audio_l2cap_send_fail_count,
-            audio_transport_uart_previous.bt.audio_l2cap_send_fail_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.audio_0x36_enqueued_count,
-            audio_transport_uart_previous.bt.audio_0x36_enqueued_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.audio_0x36_sent_count,
-            audio_transport_uart_previous.bt.audio_0x36_sent_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.normal_0x31_rx_count,
-            audio_transport_uart_previous.bt.normal_0x31_rx_count
-        )),
-        static_cast<unsigned long>(audio_transport_uart_counter_delta(
-            current.bt.normal_0x31_sent_count,
-            audio_transport_uart_previous.bt.normal_0x31_sent_count
-        ))
-    );
-
-    audio_transport_uart_previous = current;
-    audio_transport_uart_next_log_us = now + AUDIO_TRANSPORT_UART_LOG_INTERVAL_US;
-}
-#endif
-
-#define RUN_MAIN_PHASE(phase_id, block) \
-    do { \
-        watchdog_telemetry_note_phase(phase_id); \
-        block \
-        watchdog_update(); \
-    } while (0)
-
-static void note_usb_input_report(uint8_t const *report, uint16_t len) {
-#if !DS5_AUDIO_DEBUG_ENABLED
-    (void)report;
-    (void)len;
-    return;
-#else
-    const uint32_t now = time_us_32();
-    if (last_input_debug_us == 0 || static_cast<uint32_t>(now - last_input_debug_us) > 250000) {
-        input_debug_burst_remaining = 8;
-    }
-    last_input_debug_us = now;
-    if (input_debug_burst_remaining == 0) {
-        return;
-    }
-    input_debug_burst_remaining--;
-    audio_debug_note_hid_event(
-        HidDebugInputReport,
-        0x01,
-        0,
-        len,
-        len > 7 && report != nullptr ? report[7] : 0
-    );
-#endif
-}
-
-static bool companion_lightbar_override_active() {
-#ifdef ENABLE_COMPANION
-    return companion_lightbar_override_enabled();
-#else
-    return false;
-#endif
-}
-
-void controller_output_submit_usb_payload(uint8_t const *payload, uint16_t payload_len) {
-    uint8_t outputData[78]{};
-    controller_packet_init_bt_output_report(outputData, reportSeqCounter);
-    uint16_t payloadLen = payload_len;
-    if (payloadLen > sizeof(outputData) - 3) {
-        payloadLen = sizeof(outputData) - 3;
-    }
-    if (payloadLen > 0) {
-        if (payload == nullptr) {
-            payloadLen = 0;
-        } else {
-            memcpy(outputData + 3, payload, payloadLen);
-        }
-    }
-
-    const bool lightbarOverride = companion_lightbar_override_active();
-    const bool hostClearsLightbar = controller_output_policy_host_output_clears_lightbar(outputData + 3, payloadLen);
-    const bool hostSetsLightbar = controller_output_policy_host_output_sets_lightbar(outputData + 3, payloadLen);
-#ifdef ENABLE_COMPANION
-    const bool triggerIntensityChanged = companion_apply_trigger_effect_intensity(outputData + 3, payloadLen);
-    uint8_t companionOutput[sizeof(outputData)]{};
-    memcpy(companionOutput, outputData, sizeof(companionOutput));
-    bool sanitizedHostOutput = triggerIntensityChanged || controller_output_policy_sanitize_host_lightbar_payload(
-        companionOutput + 3,
-        payloadLen,
-        lightbarOverride
-    );
-    sanitizedHostOutput = controller_output_policy_sanitize_host_speaker_amp_report(companionOutput, sizeof(companionOutput))
-        || sanitizedHostOutput;
-    sanitizedHostOutput = controller_output_policy_sanitize_host_mic_report(companionOutput, sizeof(companionOutput))
-        || sanitizedHostOutput;
-    if (sanitizedHostOutput) {
-        uint8_t forwardedHostReport[48]{};
-        uint16_t forwardedLen = static_cast<uint16_t>(payloadLen + 1);
-        if (forwardedLen > sizeof(forwardedHostReport)) {
-            forwardedLen = sizeof(forwardedHostReport);
-        }
-        if (forwardedLen > 0) {
-            forwardedHostReport[0] = 0x02;
-            if (forwardedLen > 1) {
-                memcpy(forwardedHostReport + 1, companionOutput + 3, forwardedLen - 1);
+    if (static_cast<uint32_t>(now_us - last_btn_us) >= 50000u) {
+        last_btn_us = now_us;
+        bool down = read_bootsel_button();
+        if (down && !was_down) {
+            down_since_us = now_us;
+            hold_fired = false;
+        } else if (down && was_down && !hold_fired &&
+                   static_cast<uint32_t>(now_us - down_since_us) >= 1500000u) {
+            hold_fired = true;
+            click_count = 0;
+            bt_forget_all();
+        } else if (!down && was_down && !hold_fired) {
+            if (static_cast<uint32_t>(now_us - down_since_us) < 500000u) {
+                click_count++;
+                last_click_us = now_us;
             }
-            companion_note_host_output_report(forwardedHostReport, forwardedLen);
         }
-    }
-#endif
-
-    // Apply configured ownership overrides before the one complete report is
-    // admitted. Classic-rumble gain is the sole normal rumble transform.
-    controller_output_policy_sanitize_host_lightbar_payload(
-        outputData + 3,
-        payloadLen,
-        lightbarOverride
-    );
-    bt_sanitize_host_speaker_amp_ownership(outputData, sizeof(outputData));
-    bt_sanitize_host_mic_ownership(outputData, sizeof(outputData));
-    controller_output_policy_apply_classic_rumble_gain_payload(
-        outputData + 3,
-        payloadLen
-    );
-
-    uint8_t audioStateData[sizeof(outputData) - 3]{};
-    if (payloadLen > 0) {
-        memcpy(audioStateData, outputData + 3, payloadLen);
-    }
-    // A later 0x36 carrier mirrors the same accepted motor strength while
-    // retaining bridge-owned speaker, microphone, and lightbar fields.
-    controller_output_policy_sanitize_host_lightbar_payload(
-        audioStateData,
-        payloadLen,
-        lightbarOverride
-    );
-    controller_output_policy_sanitize_host_speaker_amp_payload(audioStateData, payloadLen);
-    controller_output_policy_sanitize_host_mic_payload(audioStateData, payloadLen);
-
-    if (!bt_write_classified_output(outputData, sizeof(outputData))) {
-        // Do not publish rejected output into future audio carriers.
-        return;
-    }
-    audio_set_state_data(audioStateData, static_cast<uint8_t>(payloadLen));
-    if (!lightbarOverride) {
-        if (hostClearsLightbar) {
-            bt_note_host_lightbar_released();
-            bt_schedule_lightbar_restore(HOST_LIGHTBAR_RESTORE_DELAY_MS);
-        } else if (hostSetsLightbar) {
-            bt_note_host_lightbar_set();
-        }
-    }
-}
-
-uint8_t interrupt_in_data[63] = {
-    0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
-    0x08, 0x00, 0x00, 0x00, 0x52, 0x43, 0x30, 0x41,
-    0x01, 0x00, 0x0e, 0x00, 0xef, 0xff, 0x03, 0x03,
-    0x7b, 0x1b, 0x18, 0xf0, 0xcc, 0x9c, 0x60, 0x00,
-    0xfc, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
-    0x00, 0x00, 0x09, 0x09, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xa7, 0xad, 0x60, 0x00, 0x29, 0x18, 0x00,
-    0x53, 0x9f, 0x28, 0x35, 0xa5, 0xa8, 0x0c, 0x8b
-};
-
-critical_section_t report_cs;
-volatile bool report_dirty = false;
-BridgeControllerState interrupt_in_state{};
-static volatile bool host_input_waiting_for_mount = false;
-static volatile uint32_t host_input_fallback_until_us = 0;
-
-// Distinct button/contact transitions each take a slot; continuous motion
-// shares one. Every queued edge goes out with the newest stick positions.
-static constexpr std::size_t HOST_INPUT_QUEUE_CAPACITY = 8;
-static ds5::ControllerInputDeliveryQueue<HOST_INPUT_QUEUE_CAPACITY> host_input_queue{};
-using ControllerInputReceiveBatch = ds5::ControllerInputReceiveBatch<2>;
-static_assert(PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT == ControllerInputReceiveBatch::capacity(),
-              "The receive handoff must hold one complete Bluetooth receive pass");
-static ControllerInputReceiveBatch controller_input_receive_batch{};
-// A report the USB class rejected. It goes out before anything queued.
-static bool host_input_retry_pending = false;
-static BridgeControllerState host_input_retry_state{};
-// The last report the USB class accepted; unknown after a reset or a mount.
-static BridgeControllerState host_input_accepted_state{};
-static bool host_input_have_accepted_state = false;
-
-// Caller holds report_cs.
-static void clear_host_input_delivery() {
-    host_input_queue.clear();
-    host_input_retry_pending = false;
-    host_input_have_accepted_state = false;
-}
-
-static constexpr uint8_t kNeutralDualSenseUsbInputReport[63] = {
-    0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
-    0x08, 0x00, 0x00, 0x00, 0x52, 0x43, 0x30, 0x41,
-    0x01, 0x00, 0x0e, 0x00, 0xef, 0xff, 0x03, 0x03,
-    0x7b, 0x1b, 0x18, 0xf0, 0xcc, 0x9c, 0x60, 0x00,
-    0xfc, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
-    0x00, 0x00, 0x09, 0x09, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xa7, 0xad, 0x60, 0x00, 0x29, 0x18, 0x00,
-    0x53, 0x9f, 0x28, 0x35, 0xa5, 0xa8, 0x0c, 0x8b
-};
-
-static bool time_reached_u32(uint32_t now, uint32_t target) {
-    return static_cast<int32_t>(now - target) >= 0;
-}
-
-static bool host_input_quiet_active(uint32_t now) {
-    if (!host_input_waiting_for_mount) {
-        return false;
-    }
-    // The waiting flag owns the deadline; zero is a valid deadline when the
-    // 32-bit microsecond clock wraps during the fallback interval.
-    if (time_reached_u32(now, host_input_fallback_until_us)) {
-        host_input_waiting_for_mount = false;
-        host_input_fallback_until_us = 0;
-        return false;
-    }
-    return true;
-}
-
-static BridgeControllerState neutral_controller_state() {
-    BridgeControllerState state{};
-    (void)dualsense_decode_usb_input_report(
-        kNeutralDualSenseUsbInputReport,
-        sizeof(kNeutralDualSenseUsbInputReport),
-        state
-    );
-    return state;
-}
-
-static bool host_input_ready_for_persona(HostPersonaMode persona) {
-    if (wake_on_lan_quiet_gate()) {
-        return false;
-    }
-#ifdef ENABLE_COMPANION
-    // Bridge-only HID instances are an inert composite helper and a wake
-    // anchor. Controller-shaped reports are valid only after the full persona
-    // has mounted.
-    if (usb_descriptor_bridge_only_active()) {
-        return false;
-    }
-#endif
-    if (!usb_mounted_active()) {
-        return false;
-    }
-    return persona == HostPersonaModeXusb360 ? xusb360_usb_ready() : tud_hid_ready();
-}
-
-static bool host_input_send_report_for_persona(HostPersonaMode persona, BridgeControllerState const &state) {
-    if (!host_input_ready_for_persona(persona)) {
-        return false;
+        was_down = down;
     }
 
-    HostPersonaInputReport report{};
-    if (!host_persona_encode_input(persona, state, report)) {
-        return false;
-    }
-
-    note_usb_input_report(report.bytes, report.len);
-    return persona == HostPersonaModeXusb360
-        ? xusb360_usb_send_report(report.bytes, report.len)
-        : tud_hid_report(report.report_id, report.bytes, report.len);
-}
-
-static uint16_t ds4_copy_input_report_payload(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
-    if (report_id != kDs4InputReportId || buffer == nullptr) {
-        return 0;
-    }
-
-    BridgeControllerState safe_state{};
-    critical_section_enter_blocking(&report_cs);
-    safe_state = interrupt_in_state;
-    critical_section_exit(&report_cs);
-
-    HostPersonaInputReport report{};
-    if (!host_persona_encode_input(HostPersonaModeDs4, safe_state, report)) {
-        return 0;
-    }
-
-    const uint16_t copy_len = std::min<uint16_t>(report.len, reqlen);
-    if (copy_len > 0) {
-        memcpy(buffer, report.bytes, copy_len);
-    }
-    return copy_len;
-}
-
-static bool dualsense_feature_report_may_use_bt_passthrough(
-    HostPersonaMode output_persona,
-    uint8_t report_id
-) {
-    if (report_id != 0x20 && report_id != 0x22) {
-        return true;
-    }
-
-    const uint8_t upstream_type = bt_controller_type();
-    if (output_persona == HostPersonaModeDualSenseEdge) {
-        return upstream_type == ControllerTypeDualSenseEdge;
-    }
-    // Keep the two Sony identities isolated. A mismatched or non-DualSense
-    // upstream controller uses the persona's synthesized identity instead.
-    return upstream_type == ControllerTypeDualSense;
-}
-
-void host_input_prepare_persona_switch() {
-    controller_input_receive_batch.clear();
-    const HostPersonaMode current_persona = host_persona_active();
-    const BridgeControllerState neutral_state = neutral_controller_state();
-    const uint32_t now = time_us_32();
-
-    critical_section_enter_blocking(&report_cs);
-    memcpy(interrupt_in_data, kNeutralDualSenseUsbInputReport, sizeof(interrupt_in_data));
-    interrupt_in_state = neutral_state;
-    clear_host_input_delivery();
-    report_dirty = false;
-    host_input_waiting_for_mount = true;
-    host_input_fallback_until_us = now + HOST_PERSONA_SWITCH_INPUT_FALLBACK_US;
-    critical_section_exit(&report_cs);
-
-    (void)host_input_send_report_for_persona(current_persona, neutral_state);
-}
-
-void host_input_note_usb_mounted() {
-    critical_section_enter_blocking(&report_cs);
-    host_input_have_accepted_state = false;
-    critical_section_exit(&report_cs);
-    host_input_waiting_for_mount = false;
-    host_input_fallback_until_us = 0;
-}
-
-void reset_controller_input_report_cache() {
-    controller_input_receive_batch.clear();
-    BridgeControllerState default_state{};
-    (void)dualsense_decode_usb_input_report(
-        kNeutralDualSenseUsbInputReport,
-        sizeof(kNeutralDualSenseUsbInputReport),
-        default_state
-    );
-
-    critical_section_enter_blocking(&report_cs);
-    memcpy(interrupt_in_data, kNeutralDualSenseUsbInputReport, sizeof(interrupt_in_data));
-    interrupt_in_state = default_state;
-    clear_host_input_delivery();
-    // Publish neutral before replacing a mounted full controller topology. A
-    // bridge-only topology never accepts controller-shaped reports.
-    report_dirty = usb_mounted_active() && !usb_descriptor_bridge_only_active();
-    critical_section_exit(&report_cs);
-}
-
-void interrupt_loop() {
-    const uint32_t now = time_us_32();
-    if (host_input_quiet_active(now)) {
-        return;
-    }
-
-    const HostPersonaMode persona = host_persona_active();
-    const bool xusb = persona == HostPersonaModeXusb360;
-    if (!host_input_ready_for_persona(persona)) {
-        return;
-    }
-
-    // Received but unprocessed input is newer than anything queued, so do not
-    // spend the endpoint on older continuous state. Only the next pending
-    // report may go first, and only when it carries a button/contact edge.
-    const bool received_input_pending = !controller_input_receive_batch.empty();
-    bool should_send = false;
-    BridgeControllerState safe_state{};
-
-    critical_section_enter_blocking(&report_cs);
-    if (received_input_pending) {
-        BridgeControllerState const *pending = host_input_retry_pending
-            ? &host_input_retry_state
-            : host_input_queue.front();
-        if (
-            !host_input_have_accepted_state
-            || pending == nullptr
-            || ds5::controller_input_transition_equivalent(host_input_accepted_state, *pending)
-        ) {
-            critical_section_exit(&report_cs);
-            return;
-        }
-    }
-    if (host_input_retry_pending) {
-        safe_state = host_input_retry_state;
-        host_input_retry_pending = false;
-        should_send = true;
-    } else if (host_input_queue.pop_front(safe_state)) {
-        should_send = true;
-    } else if (report_dirty) {
-        safe_state = interrupt_in_state;
-        report_dirty = false;
-        should_send = true;
-    }
-    if (should_send) {
-        ds5::controller_input_refresh_analog_sticks(safe_state, interrupt_in_state);
-    }
-    critical_section_exit(&report_cs);
-
-    if (!should_send) {
-        return;
-    }
-    HostPersonaInputReport safe_report{};
-    bool queued = false;
-    if (host_persona_encode_input(persona, safe_state, safe_report)) {
-        note_usb_input_report(safe_report.bytes, safe_report.len);
-        queued = xusb
-            ? xusb360_usb_send_report(safe_report.bytes, safe_report.len)
-            : tud_hid_report(safe_report.report_id, safe_report.bytes, safe_report.len);
-        if (!queued) {
-            DS5_LOG("[USBHID] tud_hid_report error\n");
+    if (click_count > 0 && static_cast<uint32_t>(now_us - last_click_us) >= 450000u) {
+        uint8_t n = click_count;
+        click_count = 0;
+        if (n == 1) {
+            if (g_telemetry.bt_acl_connected) bt_disconnect_now();
+            else bt_start_pairing();
+        } else if (n == 2) {
+            watchdog_reboot(0, 0, 0);
+        } else if (n >= 3) {
+            reset_usb_boot(0, 0);
         }
     }
 
-    critical_section_enter_blocking(&report_cs);
-    if (queued) {
-        host_input_accepted_state = safe_state;
-        host_input_have_accepted_state = true;
-    } else {
-        // Keep the unsent report. Equivalent newer input may refresh it, but
-        // the transitions queued behind it are never skipped.
-        host_input_retry_state = safe_state;
-        host_input_retry_pending = true;
-    }
-    critical_section_exit(&report_cs);
-}
-
-void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
-    // DS5_LOG("[Main] BT data callback: channel=%u len=%u\n", channel, len);
-    // Controller input and microphone audio are dropped while Wi-Fi runs.
-    if (wake_on_lan_quiet_gate()) {
-        return;
-    }
-    if (data == nullptr || channel != INTERRUPT || len <= 2 || data[1] != 0x31) {
-        return;
-    }
-
-    if ((data[2] & 0x02) != 0) {
-        audio_mic_add_packet(data + 4, len > 4 ? static_cast<uint16_t>(len - 4) : 0);
-        return;
-    }
-
-    if (len < 3 + sizeof(interrupt_in_data)) {
-        return;
-    }
-
-    // BTstack reuses its packet buffer after this callback. Copy the report,
-    // but leave chords, decoding and USB submission until the radio poll has
-    // returned, so the poll ends sooner and USB is serviced between reports.
-    (void)controller_input_receive_batch.push(data + 3);
-}
-
-static __attribute__((noinline, noclone)) void __not_in_flash_func(process_controller_input_packet)(
-    ds5::ReceivedControllerInputPacket const &packet
-) {
-    if (!controller_input_receive_batch.current(packet)) {
-        return;
-    }
-    uint8_t controller_report[sizeof(packet.report)];
-    memcpy(controller_report, packet.report, sizeof(controller_report));
-    set_headset((controller_report[53] & 1) != 0);
-#ifdef ENABLE_COMPANION
-    companion_process_controller_report(controller_report, sizeof(controller_report));
-    // A chord can disconnect the controller or change persona. Do not publish
-    // an old session's held controls after its state has been reset.
-    if (!controller_input_receive_batch.current(packet)) {
-        return;
-    }
-#endif
-
-    BridgeControllerState controller_state{};
-    if (!dualsense_decode_usb_input_report(controller_report, sizeof(controller_report), controller_state)) {
-        return;
-    }
-
-    critical_section_enter_blocking(&report_cs);
-    memcpy(interrupt_in_data, controller_report, sizeof(controller_report));
-    interrupt_in_state = controller_state;
-    if (host_input_waiting_for_mount) {
-        // No endpoint exists while the persona re-enumerates. Keep only the
-        // latest state for the first mounted report, not a backlog.
-        report_dirty = true;
-    } else {
-        report_dirty = false;
-        if (
-            !host_input_retry_pending
-            || !host_input_queue.refresh_retry(host_input_retry_state, controller_state)
-        ) {
-            (void)host_input_queue.push(controller_state);
+    static uint32_t last_led_us = 0;
+    static bool led_on = false;
+    uint32_t period_us = g_telemetry.bt_interrupt_ready ? 0
+                       : g_telemetry.bt_pairing_active ? 150000u
+                                                       : 700000u;
+    if (period_us == 0) {
+        if (!led_on) {
+            led_on = true;
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
         }
-    }
-    critical_section_exit(&report_cs);
-#ifdef ENABLE_COMPANION
-    companion_update_controller_report(controller_report, sizeof(controller_report));
-#endif
-}
-
-static void drain_controller_input_batch(bool service_usb) {
-    controller_input_receive_batch.drain(process_controller_input_packet, [service_usb] {
-        // An edge may go out before the next packet is processed; continuous
-        // state waits for the last one. This runs even when decoding rejected
-        // the last packet, so earlier valid input is never stranded.
-        interrupt_loop();
-        // One USB service per processed packet, bounded by the batch.
-        if (service_usb) {
-            tud_task();
-        }
-    });
-}
-
-static void poll_bluetooth_once() {
-    // The main loop drains every batch after its poll; this only guarantees a
-    // full batch can never refuse the next pass's reports.
-    drain_controller_input_batch(false);
-    cyw43_arch_poll();
-}
-
-// The controller's IN endpoint finished a transfer. Chain the next pending
-// report now instead of waiting for the main loop's next submission point.
-// With nothing new to send, nothing is sent.
-void host_input_report_complete() {
-    interrupt_loop();
-}
-
-// Invoked when received GET_REPORT control request
-// Application must fill buffer report's content and return its length.
-// Return zero will cause the stack to STALL request
-uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer,
-                               uint16_t reqlen) {
-    if (report_type == HID_REPORT_TYPE_INPUT && wake_on_lan_quiet_gate()) {
-        return 0;
-    }
-    (void) itf;
-    (void) report_id;
-    (void) report_type;
-    (void) buffer;
-    (void) reqlen;
-
-#ifdef ENABLE_COMPANION
-    if (usb_descriptor_bridge_only_active()) {
-        return 0;
-    }
-    if (itf == host_persona_keyboard_hid_instance()) {
-        return 0;
-    }
-#endif
-
-    if (host_persona_active() == HostPersonaModeDs4) {
-        if (report_type == HID_REPORT_TYPE_INPUT) {
-            return ds4_copy_input_report_payload(report_id, buffer, reqlen);
-        }
-        if (report_type == HID_REPORT_TYPE_FEATURE) {
-            return ds4_persona_get_feature_report(report_id, buffer, reqlen);
-        }
-        return 0;
-    }
-
-    const HostPersonaMode active_persona = host_persona_active();
-    if (
-        active_persona != HostPersonaModeDualSense
-        && active_persona != HostPersonaModeDualSenseEdge
-    ) {
-        return 0;
-    }
-
-    audio_debug_note_hid_event(
-        HidDebugGetReport,
-        report_id,
-        static_cast<uint8_t>(report_type),
-        reqlen,
-        0
-    );
-    if (report_type != HID_REPORT_TYPE_FEATURE) {
-        return 0;
-    }
-
-    uint16_t copy_len = 0;
-    if (
-        dualsense_feature_report_may_use_bt_passthrough(active_persona, report_id)
-        && bt_copy_feature_data(report_id, buffer, reqlen, &copy_len)
-        && buffer != nullptr
-    ) {
-        return copy_len;
-    }
-
-    return dualsense_persona_get_feature_report(active_persona, report_id, buffer, reqlen);
-}
-
-// Invoked when received SET_REPORT control request or
-// received data on OUT endpoint ( Report ID = 0, Type = 0 )
-void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer,
-                           uint16_t bufsize) {
-    // Game output must not reach the controller while Wi-Fi runs.
-    if (wake_on_lan_quiet_gate()) {
-        return;
-    }
-    (void) itf;
-    (void) report_id;
-    (void) report_type;
-    (void) buffer;
-    (void) bufsize;
-
-#ifdef ENABLE_COMPANION
-    if (usb_descriptor_bridge_only_active()) {
-        return;
-    }
-    if (itf == host_persona_keyboard_hid_instance()) {
-        return;
-    }
-#endif
-
-    const HostPersonaMode active_persona = host_persona_active();
-    audio_debug_note_hid_event(
-        HidDebugSetReport,
-        report_id,
-        static_cast<uint8_t>(report_type),
-        bufsize,
-        bufsize > 0 && buffer != nullptr ? buffer[0] : 0
-    );
-
-    if (active_persona == HostPersonaModeDs4) {
-        if (report_type == HID_REPORT_TYPE_FEATURE) {
-            ds4_persona_set_feature_report(report_id, buffer, bufsize);
-            return;
-        }
-
-        uint8_t output_report[64]{};
-        uint8_t const *output_data = buffer;
-        uint16_t output_len = bufsize;
-        if (report_id != 0) {
-            output_report[0] = report_id;
-            const uint16_t copy_len = static_cast<uint16_t>(std::min<uint16_t>(bufsize, sizeof(output_report) - 1));
-            if (copy_len > 0 && buffer != nullptr) {
-                memcpy(output_report + 1, buffer, copy_len);
-            }
-            output_data = output_report;
-            output_len = static_cast<uint16_t>(copy_len + 1);
-        }
-
-        uint8_t payload[ds5::output::kCommonPayloadSize]{};
-        uint16_t payload_len = 0;
-        if (host_persona_decode_output_to_ds5_payload(
-            active_persona,
-            output_data,
-            output_len,
-            payload,
-            sizeof(payload),
-            payload_len
-        )) {
-            usb_note_hid_output();
-#ifdef ENABLE_COMPANION
-            companion_note_trigger_trace_report(CompanionTriggerTraceHost, output_data, output_len);
-            companion_note_feedback_trace_report(CompanionFeedbackTraceHost, output_data, output_len);
-#endif
-            controller_output_submit_usb_payload(payload, payload_len);
-        }
-        return;
-    }
-
-    // Output report 0x02 arrives on INTERRUPT OUT with its ID in the buffer,
-    // or as a control SET_REPORT(Output) with the ID stripped by TinyUSB.
-    // Apps that use HidD_SetOutputReport send it the second way.
-    uint8_t const *output_data = nullptr;
-    uint16_t output_len = 0;
-    uint8_t control_output_report[64]{};
-    if (report_id == 0 && buffer != nullptr && bufsize > 0 && buffer[0] == 0x02) {
-        output_data = buffer;
-        output_len = bufsize;
-    } else if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 0x02 && buffer != nullptr && bufsize > 0) {
-        control_output_report[0] = report_id;
-        const uint16_t copy_len = static_cast<uint16_t>(std::min<uint16_t>(bufsize, sizeof(control_output_report) - 1));
-        memcpy(control_output_report + 1, buffer, copy_len);
-        output_data = control_output_report;
-        output_len = static_cast<uint16_t>(copy_len + 1);
-    }
-    if (output_data != nullptr) {
-        usb_note_hid_output();
-#ifdef ENABLE_COMPANION
-        companion_note_trigger_trace_report(CompanionTriggerTraceHost, output_data, output_len);
-        companion_note_feedback_trace_report(CompanionFeedbackTraceHost, output_data, output_len);
-#endif
-        controller_output_submit_usb_payload(output_data + 1, static_cast<uint16_t>(output_len - 1));
-        return;
-    }
-    if (
-        report_id == 0x80
-        || report_id == 0x60
-        || report_id == 0x62
-        || report_id == 0x61
-    ) {
-        set_feature_data(report_id,buffer,bufsize);
-        return;
+    } else if (static_cast<uint32_t>(now_us - last_led_us) >= period_us) {
+        last_led_us = now_us;
+        led_on = !led_on;
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
     }
 }
 
-// Wake-on-LAN (ported from Kitsune Input). Runs at the top level of the main
-// loop only: commands and Bluetooth events can close the quiet gate, but only
-// this pass may start WLAN, after the audio, input and output queues retired.
-static void service_wake_on_lan() {
-#ifdef ENABLE_COMPANION
-    companion_wake_command_poll();
-#endif
-    static bool quiet_applied = false;
-    const auto apply_gate = []() {
-        const bool quiet = wake_on_lan_quiet_gate();
-        if (quiet == quiet_applied) {
-            return;
-        }
-        quiet_applied = quiet;
-        bt_set_wake_radio_quiet(quiet);
-        usb_set_gameplay_quiet(quiet);
-        audio_handle_controller_disconnect();
-        bt_quiesce_gameplay_output();
-        controller_input_receive_batch.clear();
-        critical_section_enter_blocking(&report_cs);
-        clear_host_input_delivery();
-        report_dirty = false;
-        critical_section_exit(&report_cs);
-    };
-    apply_gate();
-    wake_on_lan_poll(
-        to_us_since_boot(get_absolute_time()) / 1000,
-        usb_wake_host_active(),
-        usb_wake_external_suspended(),
-        bt_wake_controllers_quiet(),
-        bt_wake_controllers_quiet() && usb_wake_host_active(),
-        bt_wake_radio_ready(),
-        usb_wake_host_firmware()
-    );
-    apply_gate();
-    // Only a host-prepared transition forces the controller off. A bridge-armed
-    // transition leaves that to the user's USB sleep-disconnect setting and
-    // arms once the controller is quiet.
-    if (
-        wake_on_lan_host_prepared()
-        && usb_wake_external_suspended()
-        && bt_is_controller_connected()
-        && !bt_expected_disconnect_pending()
-    ) {
-        (void)bt_power_off_controller();
-    }
-    // A failed WLAN teardown must never resume gameplay with an active radio.
-    // Reboot clears the RAM-only wake arm; it cannot repeat the same attempt.
-    // The reset keeps which teardown check failed for Settings > Last Restart.
-    if (wake_on_lan_recovery_required()) {
-        watchdog_telemetry_record_reset_reason(WatchdogResetReason::WifiTeardown, wake_on_lan_fault_detail());
-        runtime_fail_fast(WatchdogResetReason::WifiTeardown);
-    }
-}
+} // namespace
+} // namespace sensa
 
 int main() {
-#if SYS_CLOCK_KHZ != 150000
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
-    sleep_ms(1000);
-    set_sys_clock_khz(SYS_CLOCK_KHZ, true);
-#endif
-
     board_init();
-    watchdog_telemetry_boot_capture();
-    {
-        // Synthetic persona identities are per bridge, so Steam and SDL never
-        // merge two bridges into one controller. Set before USB enumerates.
-        pico_unique_board_id_t board_id{};
-        pico_get_unique_board_id(&board_id);
-        ds4_persona_set_identity_seed(board_id.id, sizeof(board_id.id));
-        dualsense_persona_set_identity_seed(board_id.id, sizeof(board_id.id));
-    }
-    usb_device_stack_init_disconnected();
-#if DS5_DEBUG_LOGS_ENABLED
-    // TinyUSB's board_init() configures its UART at 115200. Reinitialize stdio
-    // after the custom USB stack so diagnostic builds use the configured baud.
-    stdio_init_all();
-#endif
-    firmware_log_init();
+    sensa::console_init();
+    sensa::usb_init();
     board_init_after_tusb();
-    firmware_log_init_btstack_sink();
+    sensa::dsp_init();
 
-    // CYW43 initialization also initializes BTstack's flash-backed TLV store.
-    // Core 1 must already be servicing cooperative XIP pause requests before
-    // that store can erase, repair, or write its bank header safely.
-    if (!audio_init()) {
-        DS5_LOG("Failed to initialize core 1 flash safety\n");
+    if (!sensa::bt_init()) {
         return 1;
     }
 
-    if (cyw43_arch_init()) {
-        DS5_LOG("Failed to initialize CYW43\n");
-        return 1;
-    }
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
+    watchdog_enable(1500, true);
 
-    if (watchdog_enable_caused_reboot()) {
-        DS5_LOG("Rebooted by Watchdog!\n");
-        WatchdogTelemetrySnapshot watchdog_snapshot{};
-        watchdog_telemetry_snapshot(&watchdog_snapshot);
-        DS5_LOG(
-            "[Watchdog] retained valid=%u reason=%s(%u) phase=%s(%u) "
-            "uptimeMs=%lu consecutive=%u detail=0x%08lx\n",
-            watchdog_snapshot.prior_snapshot_valid ? 1u : 0u,
-            watchdog_telemetry_reason_name(static_cast<uint8_t>(watchdog_snapshot.prior_reason)),
-            static_cast<unsigned int>(watchdog_snapshot.prior_reason),
-            watchdog_telemetry_phase_name(watchdog_snapshot.prior_phase),
-            static_cast<unsigned int>(watchdog_snapshot.prior_phase),
-            static_cast<unsigned long>(watchdog_snapshot.prior_uptime_ms),
-            static_cast<unsigned int>(watchdog_snapshot.prior_abnormal_reset_count),
-            static_cast<unsigned long>(watchdog_snapshot.prior_detail)
-        );
-    } else {
-        DS5_LOG("Clean boot\n");
-    }
-  
-    // Initialize the critical section for the report buffer
-    critical_section_init(&report_cs);
-#ifdef ENABLE_COMPANION
-    companion_init();
-#endif
-
-    bt_init();
-    bt_register_data_callback(on_bt_data);
-    wake_on_lan_init();
-
-    watchdog_enable(1000, true);
-
-    // Each pass polls Bluetooth twice. A poll only stages the reports it reads;
-    // after the USB service that follows it, the batch is drained, servicing
-    // USB between individual reports. Completed IN transfers chain the next
-    // pending report themselves. Every tud_task() is followed by the bounded
-    // Bluetooth send service, the only place deferred sends are re-issued.
-    while (1) {
+    while (true) {
         watchdog_update();
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Cyw43, {
-            poll_bluetooth_once();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::InterruptAfterCyw43, {
-            interrupt_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::TinyUsb, {
-            tud_task();
-            bt_output_service_after_usb();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::InterruptAfterCyw43, {
-            drain_controller_input_batch(true);
-            bt_output_service_after_usb();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::WakeOnLan, {
-            service_wake_on_lan();
-        });
-        RUN_MAIN_PHASE(
-            WatchdogMainLoopPhase::FirmwareLogFlush,
-            {
-                firmware_log_flush_live();
-            }
-        );
-        RUN_MAIN_PHASE(
-            WatchdogMainLoopPhase::InterruptBeforeAudio,
-            {
-                interrupt_loop();
-            }
-        );
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::UsbPower, {
-            usb_pm_poll();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Audio, {
-            audio_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::TinyUsb, {
-            tud_task();
-            bt_output_service_after_usb();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Cyw43Second, {
-            poll_bluetooth_once();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::InterruptAfterCyw43, {
-            interrupt_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::TinyUsb, {
-            tud_task();
-            bt_output_service_after_usb();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::InterruptAfterCyw43, {
-            drain_controller_input_batch(true);
-            bt_output_service_after_usb();
-        });
-        // A second audio pass keeps USB audio and Bluetooth audio sends at the
-        // same cadence now that each loop polls the radio twice.
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Audio, {
-            audio_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Button, {
-            button_check();
-        });
-        if (!wake_on_lan_quiet_gate()) {
-            RUN_MAIN_PHASE(WatchdogMainLoopPhase::Lightbar, {
-                bt_lightbar_loop();
-            });
-        }
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Rssi, {
-            bt_signal_strength_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Inquiry, {
-            bt_inquiry_loop();
-        });
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::ConnectionRecovery, {
-            bt_connection_recovery_loop();
-        });
-        if (!wake_on_lan_quiet_gate()) {
-            RUN_MAIN_PHASE(WatchdogMainLoopPhase::FeaturePrefetch, {
-                bt_feature_prefetch_loop();
-            });
-            RUN_MAIN_PHASE(WatchdogMainLoopPhase::OutputRetry, {
-                bt_output_retry_loop();
-            });
-        }
-#ifdef ENABLE_COMPANION
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::Companion, {
-            companion_loop();
-        });
-#endif
-        RUN_MAIN_PHASE(
-            WatchdogMainLoopPhase::InterruptAfterCompanion,
-            {
-                interrupt_loop();
-            }
-        );
-        RUN_MAIN_PHASE(WatchdogMainLoopPhase::TinyUsb, {
-            tud_task();
-            bt_output_service_after_usb();
-        });
-        watchdog_telemetry_heartbeat(time_us_32());
-#if DS5_DEBUG_LOGS_ENABLED
-        audio_transport_uart_log_if_due(time_us_32());
-#endif
+        sensa::bt_poll();
+        sensa::usb_poll();
+        sensa::dsp_poll();
+        sensa::console_poll();
+        sensa::poll_bootsel_and_led(time_us_32());
     }
 }

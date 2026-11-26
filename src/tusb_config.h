@@ -1,192 +1,69 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 Ha Thach (tinyusb.org)
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- *
- */
-
-#ifndef TUSB_CONFIG_H_
-#define TUSB_CONFIG_H_
-
-#include "pico/platform/sections.h"
+#ifndef _SENSA_TUSB_CONFIG_H
+#define _SENSA_TUSB_CONFIG_H
 
 #ifdef __cplusplus
- extern "C" {
+extern "C" {
 #endif
 
-//--------------------------------------------------------------------+
-// Board Specific Configuration
-//--------------------------------------------------------------------+
-
-// RHPort number used for device can be defined by board.mk, default to port 0
-#ifndef BOARD_TUD_RHPORT
-#define BOARD_TUD_RHPORT      0
-#endif
-
-// RHPort max operational speed can defined by board.mk
-#ifndef BOARD_TUD_MAX_SPEED
-#define BOARD_TUD_MAX_SPEED   OPT_MODE_DEFAULT_SPEED
-#endif
-
-//--------------------------------------------------------------------
-// COMMON CONFIGURATION
-//--------------------------------------------------------------------
-
-// defined by compiler flags for flexibility
 #ifndef CFG_TUSB_MCU
 #error CFG_TUSB_MCU must be defined
 #endif
 
 #ifndef CFG_TUSB_OS
-#define CFG_TUSB_OS           OPT_OS_NONE
+#define CFG_TUSB_OS OPT_OS_NONE
 #endif
 
-#ifndef CFG_TUSB_DEBUG
-#define CFG_TUSB_DEBUG        0
-#endif
+#define CFG_TUSB_RHPORT0_MODE OPT_MODE_DEVICE
 
-// Enable Device stack
-#define CFG_TUD_ENABLED       1
-
-// Default is max speed that hardware controller could support with on-chip PHY
-#define CFG_TUD_MAX_SPEED     BOARD_TUD_MAX_SPEED
-
-/* USB DMA on some MCUs can only access a specific SRAM region with restriction on alignment.
- * Tinyusb use follows macros to declare transferring memory so that they can be put
- * into those specific section.
- * e.g
- * - CFG_TUSB_MEM SECTION : __attribute__ (( section(".usb_ram") ))
- * - CFG_TUSB_MEM_ALIGN   : __attribute__ ((aligned(4)))
- */
 #ifndef CFG_TUSB_MEM_SECTION
 #define CFG_TUSB_MEM_SECTION
 #endif
 
 #ifndef CFG_TUSB_MEM_ALIGN
-#define CFG_TUSB_MEM_ALIGN          __attribute__ ((aligned(4)))
+#define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
 #endif
 
-//--------------------------------------------------------------------
-// DEVICE CONFIGURATION
-//--------------------------------------------------------------------
+#define CFG_TUD_ENDPOINT0_SIZE 64
 
-#ifndef CFG_TUD_ENDPOINT0_SIZE
-#define CFG_TUD_ENDPOINT0_SIZE    64
-#endif
+// Dedicated DualSense Audio + HID + CDC Diagnostic Serial Console
+#define CFG_TUD_CDC 1
+#define CFG_TUD_MSC 0
+#define CFG_TUD_HID 1
+#define CFG_TUD_MIDI 0
+#define CFG_TUD_AUDIO 1
+#define CFG_TUD_VENDOR 0
 
-//------------- CLASS -------------//
-#ifdef ENABLE_COMPANION
-#define CFG_TUD_AUDIO             1
-#else
-#define CFG_TUD_AUDIO             2
-#endif
-#ifdef ENABLE_COMPANION
-#define CFG_TUD_HID               2
-#else
-#define CFG_TUD_HID               1
-#endif
-#define CFG_TUD_CDC               1
-#define CFG_TUD_MSC               0
-#define CFG_TUD_MIDI              0
-#ifdef ENABLE_COMPANION
-#define CFG_TUD_VENDOR            1
-#else
-#define CFG_TUD_VENDOR            0
-#endif
+#define CFG_TUD_HID_EP_BUFSIZE 64
 
-// HID buffer size Should be sufficient to hold ID (if any) + Data
-#define CFG_TUD_HID_EP_BUFSIZE    64
+#define CFG_TUD_CDC_RX_BUFSIZE 256
+#define CFG_TUD_CDC_TX_BUFSIZE 2048
+#define CFG_TUD_CDC_EP_BUFSIZE 64
 
-// Companion control bridge. Bulk traffic bypasses TinyUSB's vendor FIFO and
-// uses host_bridge.cpp's direct endpoint buffer. Keep the otherwise-unused
-// class FIFO to one packet so it does not consume audio SRAM.
-#define CFG_TUD_VENDOR_EPSIZE     64
-#define CFG_TUD_VENDOR_RX_BUFSIZE 64
-#define CFG_TUD_VENDOR_TX_BUFSIZE 64
+// UAC 1.0 Audio: 4-ch 48kHz OUT (Speaker L/R + Haptics L/R) + 1-ch 48kHz IN (Mic)
+#define CFG_TUD_AUDIO_FUNC_1_N_AS_INT 2
+#define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ 64
 
-//--------------------------------------------------------------------
-// AUDIO CLASS DRIVER CONFIGURATION
-//--------------------------------------------------------------------
+#define CFG_TUD_AUDIO_ENABLE_EP_OUT 1
+#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX 4
+#define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_RX 48000
+#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX 2
+#define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX 16
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX 392
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ 3072
 
-#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX              4
+#define CFG_TUD_AUDIO_ENABLE_EP_IN 1
+#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX 1
+#define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_TX 48000
+#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX 2
+#define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_TX 16
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX 96
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ 512
 
-// 16bit data in 16bit slots
-#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX      2
-#define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX              16
-
-// The largest runtime controller-microphone contract is DualSense Edge stereo.
-// Other personas expose mono and use only one channel of this allocation.
-#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX              2
-#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX      2
-#define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_TX              16
-
-// Legacy Raw PCM return path (second IN/TX function). Companion builds use the
-// private WinUSB isoch PCM transport instead, so this function is omitted there.
-#ifndef ENABLE_COMPANION
-#define CFG_TUD_AUDIO_FUNC_2_N_CHANNELS_TX              2
-#define CFG_TUD_AUDIO_FUNC_2_N_BYTES_PER_SAMPLE_TX      2
-#define CFG_TUD_AUDIO_FUNC_2_RESOLUTION_TX              16
-#endif
-
-// UAC1 Full-Speed endpoint size.
-#define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_RX         48000
-#define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_TX         48000
-#define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE            CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_RX
-#ifndef ENABLE_COMPANION
-#define CFG_TUD_AUDIO_FUNC_2_SAMPLE_RATE            48000
-#endif
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT     TUD_AUDIO_EP_SIZE(false, CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_RX, CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN      TUD_AUDIO_EP_SIZE(false, CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE_TX, CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX)
-#ifndef ENABLE_COMPANION
-#define CFG_TUD_AUDIO_FUNC_2_FORMAT_1_EP_SZ_IN      TUD_AUDIO_EP_SIZE(false, CFG_TUD_AUDIO_FUNC_2_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_2_N_BYTES_PER_SAMPLE_TX, CFG_TUD_AUDIO_FUNC_2_N_CHANNELS_TX)
-#endif
-#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX          CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT
-#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX           CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN
-#ifndef ENABLE_COMPANION
-#define CFG_TUD_AUDIO_FUNC_2_EP_OUT_SZ_MAX          0
-#define CFG_TUD_AUDIO_FUNC_2_EP_IN_SZ_MAX           CFG_TUD_AUDIO_FUNC_2_FORMAT_1_EP_SZ_IN
-#endif
-
-#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (3 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX)
-#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (16 * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX)
-#ifndef ENABLE_COMPANION
-#define CFG_TUD_AUDIO_FUNC_2_EP_OUT_SW_BUF_SZ       0
-#define CFG_TUD_AUDIO_FUNC_2_EP_IN_SW_BUF_SZ        (16 * CFG_TUD_AUDIO_FUNC_2_EP_IN_SZ_MAX)
-#endif
-
-// Enable OUT EP (speaker) and IN EP (mic).
-#define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
-#define CFG_TUD_AUDIO_ENABLE_EP_IN                  1
-
-// CDC FIFO size of TX and RX
-#define CFG_TUD_CDC_RX_BUFSIZE   64
-#define CFG_TUD_CDC_TX_BUFSIZE   64
-
-// CDC Endpoint transfer buffer size, more is faster
-// Leave it as default size (512 for HS, 64 for FS) unless your host application
-// is able to send ZLP (Zero Length Packet) to terminate transfer !
-#define CFG_TUD_CDC_EP_BUFSIZE   64
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 0
+#define CFG_TUD_AUDIO_ENABLE_INTERRUPT_EP 0
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* TUSB_CONFIG_H_ */
+#endif

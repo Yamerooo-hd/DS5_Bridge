@@ -1,111 +1,78 @@
-name: Build firmware
+name: Build SensaBridge Firmware
 
 on:
   push:
-    branches:
-      - "**"
-  pull_request:
-    branches:
-      - main
+    branches: ["**"]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-env:
-  PICO_SDK_REF: 2.3.0
-  TINYUSB_REF: 2d56dc533e45e4e91b15e93fdab5e22e964f328d
-  PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
-  ARM_TOOLCHAIN_VERSION: 15.2.rel1
-  ARM_TOOLCHAIN_URL: https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
-  ARM_TOOLCHAIN_PATH: ${{ github.workspace }}/arm-toolchain
 
 jobs:
   build:
-    name: Build companion UF2
     runs-on: ubuntu-latest
+    env:
+      PICO_SDK_REF: "2.3.0"
+      TINYUSB_REF: "2d56dc533e45e4e91b15e93fdab5e22e964f328d"
+      ARM_TOOLCHAIN_VERSION: "15.2.rel1"
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
+        uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          sudo apt update
-          sudo apt install -y cmake python3 build-essential ninja-build
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build xz-utils curl python3
 
-      # The Ubuntu apt-packaged gcc-arm-none-eabi 13.2 (15:13.2.rel1-2)
-      # produces Waveshare RP2350B-Plus-W binaries with audible audio static
-      # that ARM's official toolchains do not exhibit. Use ARM's 15.2.Rel1
-      # tarball instead of the apt package.
-      - name: Cache ARM toolchain
+      - name: Cache Arm GNU Toolchain
         id: cache-arm-toolchain
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
-          path: ${{ env.ARM_TOOLCHAIN_PATH }}
-          key: ${{ runner.os }}-${{ runner.arch }}-arm-toolchain-${{ env.ARM_TOOLCHAIN_VERSION }}
+          path: ${{ runner.temp }}/arm-gnu-toolchain
+          key: arm-gnu-toolchain-${{ env.ARM_TOOLCHAIN_VERSION }}-${{ runner.arch }}
 
-      - name: Download ARM toolchain
+      - name: Install Arm GNU Toolchain
         if: steps.cache-arm-toolchain.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$ARM_TOOLCHAIN_PATH"
-          curl -fsSL "$ARM_TOOLCHAIN_URL" | sudo tar -xJ -C "$ARM_TOOLCHAIN_PATH" --strip-components=1
-          sudo chmod -R a+rX "$ARM_TOOLCHAIN_PATH"
+          ARCH="${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}"
+          TARBALL="arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-${ARCH}-arm-none-eabi.tar.xz"
+          curl -fL "https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VERSION}/binrel/${TARBALL}" -o "/tmp/${TARBALL}"
+          mkdir -p "${{ runner.temp }}/arm-gnu-toolchain"
+          tar -xf "/tmp/${TARBALL}" -C "${{ runner.temp }}/arm-gnu-toolchain" --strip-components=1
+          rm -f "/tmp/${TARBALL}"
 
-      - name: Add ARM toolchain to PATH
-        run: |
-          echo "$ARM_TOOLCHAIN_PATH/bin" >> "$GITHUB_PATH"
-
-      - name: Verify ARM toolchain
-        run: |
-          which arm-none-eabi-gcc
-          arm-none-eabi-gcc --version
-
-      - name: Download Pico SDK
-        run: |
-          git clone --depth 1 --branch "$PICO_SDK_REF" https://github.com/raspberrypi/pico-sdk.git "$PICO_SDK_PATH"
-          git -C "$PICO_SDK_PATH" submodule update --init --recursive
-
-      - name: Switch TinyUSB to configured revision
-        run: |
-          if ! git -C "$PICO_SDK_PATH/lib/tinyusb" rev-parse -q --verify "${TINYUSB_REF}^{commit}" >/dev/null; then
-            git -C "$PICO_SDK_PATH/lib/tinyusb" fetch --depth 1 origin "$TINYUSB_REF"
-          fi
-          git -C "$PICO_SDK_PATH/lib/tinyusb" checkout --detach "$TINYUSB_REF"
-          test "$(git -C "$PICO_SDK_PATH/lib/tinyusb" rev-parse HEAD)" = "$TINYUSB_REF"
-
-      - name: Build companion firmware
-        run: |
-          cmake -S . -B build/companion -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
-            -DENABLE_COMPANION=ON
-          cmake --build build/companion --target ds5-bridge
-          mkdir -p artifacts
-          cp build/companion/ds5-bridge.uf2 artifacts/ds5-bridge-companion.uf2
-
-      - name: Build companion firmware (Waveshare RP2350B-Plus-W)
-        run: |
-          cmake -S . -B build/waveshare -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
-            -DENABLE_COMPANION=ON \
-            -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON
-          cmake --build build/waveshare --target ds5-bridge
-          cp build/waveshare/ds5-bridge.uf2 artifacts/ds5-bridge-companion-waveshare.uf2
-
-      - name: Upload companion UF2 artifact
-        uses: actions/upload-artifact@v7
+      - name: Cache Pico SDK and TinyUSB
+        id: cache-pico-sdk
+        uses: actions/cache@v4
         with:
-          path: artifacts/ds5-bridge-companion.uf2
-          archive: false
-          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/pico-sdk
+            ${{ runner.temp }}/tinyusb
+          key: pico-sdk-${{ env.PICO_SDK_REF }}-tinyusb-${{ env.TINYUSB_REF }}-btstack-cyw43-v1
 
-      - name: Upload Waveshare companion UF2 artifact
-        uses: actions/upload-artifact@v7
+      - name: Checkout Pico SDK and TinyUSB
+        if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
+        run: |
+          rm -rf "${{ runner.temp }}/pico-sdk" "${{ runner.temp }}/tinyusb"
+          git clone --depth 1 --branch "${{ env.PICO_SDK_REF }}" https://github.com/raspberrypi/pico-sdk.git "${{ runner.temp }}/pico-sdk"
+          git -C "${{ runner.temp }}/pico-sdk" submodule update --init --depth 1 lib/btstack lib/cyw43-driver
+          git clone https://github.com/hathach/tinyusb.git "${{ runner.temp }}/tinyusb"
+          git -C "${{ runner.temp }}/tinyusb" checkout "${{ env.TINYUSB_REF }}"
+
+      - name: Configure and build SensaBridge (pico2_w)
+        run: |
+          export PATH="${{ runner.temp }}/arm-gnu-toolchain/bin:$PATH"
+          cmake -S . -B build -G Ninja \
+            -DPICO_SDK_PATH="${{ runner.temp }}/pico-sdk" \
+            -DPICO_TINYUSB_PATH="${{ runner.temp }}/tinyusb" \
+            -DPICO_BOARD=pico2_w \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          arm-none-eabi-size build/sensa-bridge.elf
+          mkdir -p dist
+          cp build/sensa-bridge.uf2 dist/sensa-bridge.uf2
+          cp build/sensa-bridge.uf2 dist/DS5-Bridge-NativeHaptics.uf2
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
         with:
-          path: artifacts/ds5-bridge-companion-waveshare.uf2
-          archive: false
-          if-no-files-found: error
+          name: sensa-bridge-pico2_w
+          path: dist/*.uf2
