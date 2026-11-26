@@ -507,7 +507,7 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             }
             return;
         }
-        if (channel == hid_ctrl_cid && size >= 2) {
+        if (channel == hid_ctrl_cid && size >= 1) {
             uint8_t hdr = packet[0];
             if ((hdr & 0xF0u) == 0xA0u && size >= 3) {
                 store_feature(packet[1], packet + 1, static_cast<uint16_t>(size - 1));
@@ -517,6 +517,8 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                     state_send_pending = true;
                     request_intr_tx();
                 }
+            } else {
+                console_printf("[BT] HID Ctrl rx len=%u b0=0x%02X\n", size, hdr);
             }
             return;
         }
@@ -1034,15 +1036,19 @@ void bt_poll() {
         }
     }
 
-    // Retry 0x31 SetHapticsMode unlock until full 0x31 input reports arrive
-    if (!rx_0x31_seen && static_cast<uint32_t>(now_us - last_state_send_us) >= 400000u) {
+    // Re-sample clock after synchronous L2CAP callbacks inside bt_submit_haptic_waveform to prevent uint32 underflow
+    now_us = time_us_32();
+
+    // Retry 0x31 SetHapticsMode unlock only when idle (never interrupt an active 0x36/0x39 haptic stream!)
+    if (!rx_0x31_seen && !dsp_is_haptics_active() &&
+        static_cast<int32_t>(now_us - last_state_send_us) >= 400000) {
         state_send_pending = true;
         request_intr_tx();
     }
 
     // Periodic 0x31 update at ~100 Hz while rumble active (or hybrid trigger updates)
     uint32_t interval_us = (g_haptic_mode == HapticMode::Mode31Synth) ? 10000u : 50000u;
-    if (static_cast<uint32_t>(now_us - last_state_send_us) >= interval_us) {
+    if (static_cast<int32_t>(now_us - last_state_send_us) >= static_cast<int32_t>(interval_us)) {
         if (g_haptic_mode == HapticMode::Mode31Synth || g_haptic_mode == HapticMode::Mode31Hybrid32) {
             uint8_t sr = 0, sl = 0;
             dsp_get_synth_motors(sr, sl);
