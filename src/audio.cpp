@@ -1184,12 +1184,14 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 }
 
 // ============================================================================
-// SimFx Adaptive Taptic Impact Engine (Ported from ds5haptics + Overdrive)
+// Dual-Layer SimFx Adaptive Taptic + Sustained Rumble Engine
 // ============================================================================
-// Combines ds5haptics' SimFx dual-envelope adaptive RMS impact detector
-// (fast 4ms/40ms envelope vs slow 700ms background + 4s auto-calibrating peak)
-// with crisp 14-20ms voice-coil strokes, instant active braking, and refractory
-// cooldowns so wireless Report 0x31 never drones on wind or city ambience.
+// Layer 1 (Transient Impact): Detects sudden impacts via SimFx Fast-vs-Slow
+// RMS ratio + instant peak and fires a solid 28-42ms full-power stroke (215-255 PWM)
+// so hits register firmly over Bluetooth HID latency without getting cut off.
+// Layer 2 (Sustained Events): If strong audio (> 0.20) continues after the initial
+// impact (explosions, tension, heavy rumble), tracks Fast RMS smoothly at 110-255 PWM
+// rather than dropping silent, while keeping low ambient wind (< 0.14) dead silent.
 // ============================================================================
 static float simfx_p_fast_l = 0.0f;
 static float simfx_p_fast_r = 0.0f;
@@ -1208,6 +1210,8 @@ static uint32_t taptic_refractory_end_left_us = 0;
 static uint32_t taptic_refractory_end_right_us = 0;
 static uint8_t taptic_pwm_left = 0;
 static uint8_t taptic_pwm_right = 0;
+static uint8_t taptic_hold_left = 0;
+static uint8_t taptic_hold_right = 0;
 
 static uint8_t taptic_last_sent_right = 0;
 static uint8_t taptic_last_sent_left = 0;
@@ -1230,6 +1234,8 @@ static void haptic_synthesis_reset() {
     taptic_refractory_end_right_us = 0;
     taptic_pwm_left = 0;
     taptic_pwm_right = 0;
+    taptic_hold_left = 0;
+    taptic_hold_right = 0;
     taptic_last_sent_right = 0;
     taptic_last_sent_left = 0;
     taptic_last_send_time_us = 0;
@@ -1255,15 +1261,16 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         return;
     }
 
-    // Constants calibrated for fs = 3000 Hz (matches ds5haptics SimFx)
+    // Constants calibrated for fs = 3000 Hz
     constexpr float ATK_FAST   = 0.0799556f; // 1 - exp(-1 / (0.004 * 3000))
     constexpr float REL_FAST   = 0.0082987f; // 1 - exp(-1 / (0.040 * 3000))
     constexpr float SLOW_COEF  = 0.0004761f; // 1 - exp(-1 / (0.700 * 3000))
     constexpr float REF_DECAY  = 0.9999167f; // exp(-1 / (4.000 * 3000))
-    constexpr float K_FLOOR    = 0.045f;
+    constexpr float K_FLOOR    = 0.055f;
     constexpr float K_REF_MIN  = 0.080f;
-    constexpr float K_LOUD     = 0.42f;
-    constexpr float K_TRANS    = 2.35f;
+    constexpr float K_LOUD     = 0.28f;
+    constexpr float K_TRANS    = 1.65f;
+    constexpr float SUSTAINED_FLOOR = 0.20f;
 
     const uint32_t now = time_us_32();
     retire_taptic_timers(now);
@@ -1274,10 +1281,11 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     float best_ratio_r = 0.0f;
     float peak_amp_l = 0.0f;
     float peak_amp_r = 0.0f;
+    float end_fast_l = 0.0f;
+    float end_fast_r = 0.0f;
 
     const int pairs = sample_bytes / 2;
     for (int i = 0; i < pairs; ++i) {
-        // Channel 3 = Left Actuator, Channel 4 = Right Actuator
         const float l = static_cast<float>(samples[i * 2]) / 127.0f;
         const float r = static_cast<float>(samples[i * 2 + 1]) / 127.0f;
         const float abs_l = std::fabs(l);
@@ -1297,16 +1305,18 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         const float e_fast_r = std::sqrt(simfx_p_fast_r);
         const float e_slow_l = std::sqrt(simfx_p_slow_l);
         const float e_slow_r = std::sqrt(simfx_p_slow_r);
+        end_fast_l = e_fast_l;
+        end_fast_r = e_fast_r;
 
         simfx_ref_l = (e_fast_l > simfx_ref_l) ? e_fast_l : std::fmax(simfx_ref_l * REF_DECAY, K_REF_MIN);
         simfx_ref_r = (e_fast_r > simfx_ref_r) ? e_fast_r : std::fmax(simfx_ref_r * REF_DECAY, K_REF_MIN);
 
-        if (e_fast_l > K_FLOOR && e_fast_l > K_LOUD * simfx_ref_l && e_fast_l > K_TRANS * std::fmax(e_slow_l, K_FLOOR)) {
+        if ((e_fast_l > K_FLOOR && e_fast_l > K_LOUD * simfx_ref_l && e_fast_l > K_TRANS * std::fmax(e_slow_l, K_FLOOR)) || abs_l >= 0.42f) {
             const float ratio = e_fast_l / std::fmax(simfx_ref_l, K_REF_MIN);
             if (ratio > best_ratio_l) best_ratio_l = ratio;
             hit_l = true;
         }
-        if (e_fast_r > K_FLOOR && e_fast_r > K_LOUD * simfx_ref_r && e_fast_r > K_TRANS * std::fmax(e_slow_r, K_FLOOR)) {
+        if ((e_fast_r > K_FLOOR && e_fast_r > K_LOUD * simfx_ref_r && e_fast_r > K_TRANS * std::fmax(e_slow_r, K_FLOOR)) || abs_r >= 0.42f) {
             const float ratio = e_fast_r / std::fmax(simfx_ref_r, K_REF_MIN);
             if (ratio > best_ratio_r) best_ratio_r = ratio;
             hit_r = true;
@@ -1314,38 +1324,49 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     }
 
     auto calc_kick_params = [](float intensity, uint32_t min_us, uint32_t max_us, uint8_t &out_pwm) -> uint32_t {
-        if (intensity >= 0.72f) {
+        if (intensity >= 0.65f) {
             out_pwm = 255;
             return max_us;
-        } else if (intensity >= 0.45f) {
-            out_pwm = 225;
+        } else if (intensity >= 0.38f) {
+            out_pwm = 235;
             return (min_us + max_us) / 2;
         } else {
-            out_pwm = 185;
+            out_pwm = 210;
             return min_us;
         }
     };
 
     if (hit_l && !taptic_refractory_active_left) {
-        const float intensity_l = std::fmin(1.0f, 0.5f * best_ratio_l + 0.5f * peak_amp_l);
-        const uint32_t dur_us = calc_kick_params(intensity_l, 14000u, 20000u, taptic_pwm_left);
+        const float intensity_l = std::fmin(1.0f, 0.45f * best_ratio_l + 0.55f * peak_amp_l);
+        const uint32_t dur_us = calc_kick_params(intensity_l, 28000u, 44000u, taptic_pwm_left);
         taptic_pulse_end_left_us = now + dur_us;
         taptic_pulse_active_left = true;
-        taptic_refractory_end_left_us = now + 80000u;
+        taptic_refractory_end_left_us = now + 55000u;
         taptic_refractory_active_left = true;
     }
 
     if (hit_r && !taptic_refractory_active_right) {
-        const float intensity_r = std::fmin(1.0f, 0.5f * best_ratio_r + 0.5f * peak_amp_r);
-        const uint32_t dur_us = calc_kick_params(intensity_r, 12000u, 16000u, taptic_pwm_right);
+        const float intensity_r = std::fmin(1.0f, 0.45f * best_ratio_r + 0.55f * peak_amp_r);
+        const uint32_t dur_us = calc_kick_params(intensity_r, 24000u, 38000u, taptic_pwm_right);
         taptic_pulse_end_right_us = now + dur_us;
         taptic_pulse_active_right = true;
-        taptic_refractory_end_right_us = now + 70000u;
+        taptic_refractory_end_right_us = now + 50000u;
         taptic_refractory_active_right = true;
     }
 
-    const uint8_t motor_left  = taptic_pulse_active_left  ? taptic_pwm_left : 0;
-    const uint8_t motor_right = taptic_pulse_active_right ? taptic_pwm_right : 0;
+    auto map_sustained = [SUSTAINED_FLOOR](float env, float peak) -> uint8_t {
+        const float lvl = std::fmax(env, peak * 0.65f);
+        if (lvl < SUSTAINED_FLOOR) return 0;
+        const float norm = std::fmin(1.0f, (lvl - SUSTAINED_FLOOR) / (1.0f - SUSTAINED_FLOOR));
+        const float pwm = 115.0f + 140.0f * norm;
+        return static_cast<uint8_t>(pwm >= 255.0f ? 255 : (pwm + 0.5f));
+    };
+
+    taptic_hold_left = map_sustained(end_fast_l, peak_amp_l);
+    taptic_hold_right = map_sustained(end_fast_r, peak_amp_r);
+
+    const uint8_t motor_left  = taptic_pulse_active_left  ? taptic_pwm_left  : taptic_hold_left;
+    const uint8_t motor_right = taptic_pulse_active_right ? taptic_pwm_right : taptic_hold_right;
 
     const bool is_zero  = ((motor_right | motor_left) == 0);
     const bool was_zero = ((taptic_last_sent_right | taptic_last_sent_left) == 0);
@@ -1358,7 +1379,7 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         taptic_last_send_time_us = now;
         bt_submit_haptic_synthesis(0, 0);
     } else if (!is_zero) {
-        if (changed || elapsed_us >= 8000u) {
+        if ((changed && elapsed_us >= 3500u) || elapsed_us >= 10000u) {
             taptic_last_sent_right = motor_right;
             taptic_last_sent_left = motor_left;
             taptic_last_send_time_us = now;
@@ -1372,8 +1393,8 @@ static void haptic_synthesis_loop(uint32_t now) {
     if (taptic_last_sent_right == 0 && taptic_last_sent_left == 0) {
         return;
     }
-    const uint8_t want_left  = taptic_pulse_active_left  ? taptic_pwm_left : 0;
-    const uint8_t want_right = taptic_pulse_active_right ? taptic_pwm_right : 0;
+    const uint8_t want_left  = taptic_pulse_active_left  ? taptic_pwm_left  : taptic_hold_left;
+    const uint8_t want_right = taptic_pulse_active_right ? taptic_pwm_right : taptic_hold_right;
     if (want_left != taptic_last_sent_left || want_right != taptic_last_sent_right) {
         taptic_last_sent_left = want_left;
         taptic_last_sent_right = want_right;
@@ -1388,22 +1409,7 @@ static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) 
     if (!bt_is_controller_connected() || samples == nullptr) {
         return false;
     }
-    // Exact SAxense / ds5haptics Report 0x32 byte layout
-    uint8_t pkt32[142]{};
-    pkt32[0] = 0x32;
-    pkt32[1] = 0x00;
-    pkt32[2] = 0x91; // sub-packet 0x11 | 0x80
-    pkt32[3] = 0x07;
-    pkt32[4] = 0xFE;
-    pkt32[5] = 0x00;
-    pkt32[6] = 0x00;
-    pkt32[7] = 0x00;
-    pkt32[8] = 0x00;
-    pkt32[9] = 0xFF;
-    pkt32[10] = haptic_0x32_counter++;
-    pkt32[11] = 0x92; // sub-packet 0x12 | 0x80
-    pkt32[12] = 0x40; // 64 bytes (32 stereo s8 frames @ 3000 Hz)
-    memcpy(pkt32 + 13, samples, 64);
+    (void)haptic_0x32_counter;
 
 #ifdef ENABLE_COMPANION
     companion_note_feedback_trace_samples(
@@ -1417,7 +1423,9 @@ static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) 
     );
 #endif
 
-    return bt_write_audio_stream(pkt32, sizeof(pkt32));
+    // Note: Cosmic Byte Sensa (PS5_JG11) ignores 0x32 over Bluetooth;
+    // skipping ignored L2CAP 0x32 packets keeps 100% BT airtime free for crisp 0x31 kicks.
+    return true;
 }
 
 static bool __not_in_flash_func(send_audio_haptics_packet)(
