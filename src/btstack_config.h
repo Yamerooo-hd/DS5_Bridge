@@ -6,6 +6,7 @@
 #endif
 
 #define ENABLE_LOG_ERROR
+#define ENABLE_PRINTF_HEXDUMP
 #define ENABLE_SOFTWARE_AES128
 #define ENABLE_SCO_OVER_HCI
 
