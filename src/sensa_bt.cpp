@@ -36,6 +36,7 @@ uint16_t hid_ctrl_pending = 0;
 uint16_t hid_intr_pending = 0;
 bool hid_ctrl_ready = false;
 bool hid_intr_ready = false;
+bool hid_session_announced = false;
 bool security_ready = false;
 
 bool pairing_window = false;
@@ -243,7 +244,7 @@ void sdp_callback(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16
     (void)size;
     uint8_t event = hci_event_packet_get_type(packet);
 
-    if (event == SDP_EVENT_QUERY_ATTRIBUTE_BYTE) {
+    if (event == SDP_EVENT_QUERY_ATTRIBUTE_VALUE || event == SDP_EVENT_QUERY_ATTRIBUTE_BYTE) {
         uint16_t attr_id = sdp_event_query_attribute_byte_get_attribute_id(packet);
         uint16_t total_len = sdp_event_query_attribute_byte_get_attribute_length(packet);
         uint16_t offset = sdp_event_query_attribute_byte_get_data_offset(packet);
@@ -442,6 +443,7 @@ void reset_session_state() {
     hid_intr_pending = 0;
     hid_ctrl_ready = false;
     hid_intr_ready = false;
+    hid_session_announced = false;
     security_ready = false;
     intr_can_send_req = false;
     ctrl_can_send_req = false;
@@ -604,7 +606,8 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 hid_intr_ready = true;
                 g_telemetry.bt_interrupt_ready = true;
             }
-            if (hid_ctrl_ready && hid_intr_ready) {
+            if (hid_ctrl_ready && hid_intr_ready && !hid_session_announced) {
+                hid_session_announced = true;
                 on_hid_session_ready();
             }
             break;

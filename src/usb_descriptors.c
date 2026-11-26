@@ -2,7 +2,7 @@
 #include "usb_descriptors.h"
 #include <string.h>
 
-#define AUDIO_AND_HID_BASE_LEN 227
+#define AUDIO_AND_HID_BASE_LEN (8 + 227)
 #define CONFIG_TOTAL_LEN (AUDIO_AND_HID_BASE_LEN + TUD_CDC_DESC_LEN)
 
 enum {
@@ -16,14 +16,14 @@ static tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
-    .bDeviceClass       = 0x00,
-    .bDeviceSubClass    = 0x00,
-    .bDeviceProtocol    = 0x00,
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     // DualSense USB identity (so Windows Audio & Control Resonant use native DualSense path)
     .idVendor           = 0x054C,
     .idProduct          = 0x0CE6,
-    .bcdDevice          = 0x0156,
+    .bcdDevice          = 0x0157,
     .iManufacturer      = STRID_MANUFACTURER,
     .iProduct           = STRID_PRODUCT,
     .iSerialNumber      = 0x00,
@@ -194,6 +194,9 @@ static uint8_t const desc_configuration[] = {
     0x00, // iConfiguration
     0xE0, // SELF-POWERED + REMOTE-WAKEUP
     0xFA, // 500mA
+
+    // --- Interface Association Descriptor (Audio Control + Streaming OUT/IN: Itf 0..2) ---
+    0x08, TUSB_DESC_INTERFACE_ASSOCIATION, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00,
 
     // --- Interface 0.0: Audio Control ---
     0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
