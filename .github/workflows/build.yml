@@ -46,14 +46,14 @@ jobs:
           path: |
             ${{ runner.temp }}/pico-sdk
             ${{ runner.temp }}/tinyusb
-          key: pico-sdk-${{ env.PICO_SDK_REF }}-tinyusb-${{ env.TINYUSB_REF }}-btstack-cyw43-v1
+          key: pico-sdk-${{ env.PICO_SDK_REF }}-tinyusb-${{ env.TINYUSB_REF }}-btstack-cyw43-lwip-v2
 
       - name: Checkout Pico SDK and TinyUSB
         if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
         run: |
           rm -rf "${{ runner.temp }}/pico-sdk" "${{ runner.temp }}/tinyusb"
           git clone --depth 1 --branch "${{ env.PICO_SDK_REF }}" https://github.com/raspberrypi/pico-sdk.git "${{ runner.temp }}/pico-sdk"
-          git -C "${{ runner.temp }}/pico-sdk" submodule update --init --depth 1 lib/btstack lib/cyw43-driver
+          git -C "${{ runner.temp }}/pico-sdk" submodule update --init --depth 1 lib/btstack lib/cyw43-driver lib/lwip
           git clone https://github.com/hathach/tinyusb.git "${{ runner.temp }}/tinyusb"
           git -C "${{ runner.temp }}/tinyusb" checkout "${{ env.TINYUSB_REF }}"
 

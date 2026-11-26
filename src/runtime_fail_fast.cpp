@@ -1,7 +1,7 @@
 #include "runtime_fail_fast.h"
 
 #include "hardware/watchdog.h"
-#include "pico/platform.h"
+#include "pico.h"
 
 extern "C" [[noreturn]] void sensa_runtime_panic(char const *message, ...) {
     (void)message;

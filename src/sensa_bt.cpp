@@ -665,7 +665,7 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 std::memcpy(g_telemetry.bt_addr, addr, 6);
                 std::memcpy(g_telemetry.bt_name, name_buf, sizeof(g_telemetry.bt_name));
                 outbound_connecting = true;
-                uint8_t st = gap_connect(addr, 0);
+                uint8_t st = gap_connect(addr, BD_ADDR_TYPE_ACL);
                 console_printf("[BT] Connecting to %s -> status=0x%02X\n", bd_addr_to_str(addr), st);
             }
             break;
@@ -724,7 +724,9 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         case HCI_EVENT_PIN_CODE_REQUEST: {
             bd_addr_t addr;
             hci_event_pin_code_request_get_bd_addr(packet, addr);
-            hci_send_cmd(&hci_pin_code_request_reply, addr, 4, "0000");
+            pin_code_t pin{};
+            std::memcpy(pin, "0000", 4);
+            hci_send_cmd(&hci_pin_code_request_reply, addr, 4, pin);
             break;
         }
 
@@ -758,7 +760,7 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
 
         case HCI_EVENT_AUTHENTICATION_COMPLETE: {
             uint8_t st = hci_event_authentication_complete_get_status(packet);
-            if (st == AUTHENTICATION_PIN_OR_KEY_MISSING && peer_addr_valid) {
+            if (st == ERROR_CODE_PIN_OR_KEY_MISSING && peer_addr_valid) {
                 console_printf("[BT] Controller rejected link key -> dropping key and re-pairing\n");
                 gap_drop_link_key_for_bd_addr(peer_addr);
                 refresh_bonded_key();
@@ -850,7 +852,7 @@ void bt_disconnect_now() {
 bool bt_start_sdp_discovery() {
     if (acl_handle == HCI_CON_HANDLE_INVALID || !peer_addr_valid) return false;
     if (sdp_stage != SdpStage::Idle) return true;
-    std::memset(&g_telemetry.sdp, 0, sizeof(g_telemetry.sdp));
+    g_telemetry.sdp = SdpSummary{};
     sdp_stage = SdpStage::QueryHid;
     uint8_t st = sdp_client_query_uuid16(&sdp_callback, peer_addr, BLUETOOTH_SERVICE_CLASS_HUMAN_INTERFACE_DEVICE_SERVICE);
     console_printf("[SDP] Starting HID Service query -> status=0x%02X\n", st);
@@ -921,7 +923,7 @@ void bt_poll() {
         bd_addr_copy(peer_addr, bonded_addr);
         peer_addr_valid = true;
         outbound_connecting = true;
-        uint8_t st = gap_connect(bonded_addr, 0);
+        uint8_t st = gap_connect(bonded_addr, BD_ADDR_TYPE_ACL);
         console_printf("[BT] Auto-connecting bonded %s -> status=0x%02X\n", bd_addr_to_str(bonded_addr), st);
     }
 

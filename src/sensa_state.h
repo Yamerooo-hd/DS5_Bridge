@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "pico/platform.h"
+#include "pico.h"
 
 namespace sensa {
 
