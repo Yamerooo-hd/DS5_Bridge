@@ -582,7 +582,8 @@ void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 bool synth = (g_haptic_mode == HapticMode::Mode31Synth);
                 bool haptics_mode_0x31 = !rx_0x31_seen ||
                                          (g_haptic_mode == HapticMode::Mode31Hybrid32) ||
-                                         ((g_haptic_mode == HapticMode::Mode36Haptics || g_haptic_mode == HapticMode::Mode39Probe) && dsp_is_haptics_active());
+                                         ((g_haptic_mode == HapticMode::Mode36Haptics || g_haptic_mode == HapticMode::Mode39Probe) &&
+                                          (dsp_is_haptics_active() || g_telemetry.usb_speaker_streaming));
                 build_0x31_packet(pkt79, synth, haptics_mode_0x31);
                 uint8_t st = l2cap_send(hid_intr_cid, pkt79, sizeof(pkt79));
                 if (st == 0) {
@@ -909,6 +910,18 @@ bool bt_start_sdp_discovery() {
 }
 
 void bt_notify_host_output() {
+    if (!hid_intr_ready) return;
+    // While 0x36/0x39 audio-haptics is actively streaming, its 0x90 subpacket already carries
+    // triggers/LEDs every 10.67 ms — flooding 0x31 at 450 Hz resets/kills the 0x36 haptic stream!
+    if ((g_haptic_mode == HapticMode::Mode36Haptics || g_haptic_mode == HapticMode::Mode39Probe) &&
+        dsp_is_haptics_active()) {
+        return;
+    }
+    // Even when idle/triggers-only, cap 0x31 rate to <= 50 Hz (20 ms) so L2CAP never floods
+    uint32_t now_us = time_us_32();
+    if (!led_override_active && static_cast<int32_t>(now_us - last_state_send_us) < 20000) {
+        return;
+    }
     state_send_pending = true;
     request_intr_tx();
 }
