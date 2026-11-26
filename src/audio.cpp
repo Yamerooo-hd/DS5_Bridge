@@ -172,6 +172,7 @@ static semaphore_t core1_flash_init_done;
 static std::atomic_bool core1_flash_init_succeeded{false};
 static std::atomic<uint32_t> mic_stream_generation{1};
 static uint32_t last_audio_us = 0;
+static uint32_t last_nonzero_speaker_us = 0;
 static bool speaker_route_active = false;
 static bool speaker_route_headset = false;
 static bool host_route_primer_toggle_pending = false;
@@ -1051,6 +1052,7 @@ void audio_handle_controller_disconnect() {
     speaker_route_active = false;
     speaker_route_headset = false;
     last_audio_us = 0;
+    last_nonzero_speaker_us = 0;
 }
 
 static bool __not_in_flash_func(should_keep_speaker_route_open)() {
@@ -1182,40 +1184,70 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 }
 
 // ============================================================================
-// Taptic Kick Transient Impulse Engine (High-Impact Discrete Haptics)
+// SimFx Adaptive Taptic Impact Engine (Ported from ds5haptics + Overdrive)
 // ============================================================================
-// Designed specifically for voice-coil controllers (Cosmic Byte Sensa / PS5_JG11).
-// Instead of continuous buzzing, it fires sharp 14-18ms full-power (255 PWM) strokes
-// on sudden audio impact edges, followed by immediate active braking and an 80ms
-// refractory silence window so each impact feels like a crisp physical THUD / SNAP.
+// Combines ds5haptics' SimFx dual-envelope adaptive RMS impact detector
+// (fast 4ms/40ms envelope vs slow 700ms background + 4s auto-calibrating peak)
+// with crisp 14-20ms voice-coil strokes, instant active braking, and refractory
+// cooldowns so wireless Report 0x31 never drones on wind or city ambience.
 // ============================================================================
+static float simfx_p_fast_l = 0.0f;
+static float simfx_p_fast_r = 0.0f;
+static float simfx_p_slow_l = 0.0f;
+static float simfx_p_slow_r = 0.0f;
+static float simfx_ref_l = 0.08f;
+static float simfx_ref_r = 0.08f;
+
+static bool taptic_pulse_active_left = false;
+static bool taptic_pulse_active_right = false;
+static bool taptic_refractory_active_left = false;
+static bool taptic_refractory_active_right = false;
 static uint32_t taptic_pulse_end_left_us = 0;
 static uint32_t taptic_pulse_end_right_us = 0;
 static uint32_t taptic_refractory_end_left_us = 0;
 static uint32_t taptic_refractory_end_right_us = 0;
+static uint8_t taptic_pwm_left = 0;
+static uint8_t taptic_pwm_right = 0;
 
-static float taptic_last_sample_left = 0.0f;
-static float taptic_last_sample_right = 0.0f;
 static uint8_t taptic_last_sent_right = 0;
 static uint8_t taptic_last_sent_left = 0;
 static uint32_t taptic_last_send_time_us = 0;
 
-// Dynamic transient threshold:
-// Ambient wind, city rumble, and soundtrack in Spider-Man stay below 20% amplitude
-// and have low attack slew rate (< 0.20 delta).
-// Real mechanical impacts (punches, landings, web-shoots) spike steeply (delta >= 0.28).
-constexpr float TAPTIC_ATTACK_THRESHOLD = 0.28f;
-
 static void haptic_synthesis_reset() {
+    simfx_p_fast_l = 0.0f;
+    simfx_p_fast_r = 0.0f;
+    simfx_p_slow_l = 0.0f;
+    simfx_p_slow_r = 0.0f;
+    simfx_ref_l = 0.08f;
+    simfx_ref_r = 0.08f;
+    taptic_pulse_active_left = false;
+    taptic_pulse_active_right = false;
+    taptic_refractory_active_left = false;
+    taptic_refractory_active_right = false;
     taptic_pulse_end_left_us = 0;
     taptic_pulse_end_right_us = 0;
     taptic_refractory_end_left_us = 0;
     taptic_refractory_end_right_us = 0;
-    taptic_last_sample_left = 0.0f;
-    taptic_last_sample_right = 0.0f;
+    taptic_pwm_left = 0;
+    taptic_pwm_right = 0;
     taptic_last_sent_right = 0;
     taptic_last_sent_left = 0;
     taptic_last_send_time_us = 0;
+}
+
+static void retire_taptic_timers(uint32_t now) {
+    if (taptic_pulse_active_left && time_reached(now, taptic_pulse_end_left_us)) {
+        taptic_pulse_active_left = false;
+    }
+    if (taptic_pulse_active_right && time_reached(now, taptic_pulse_end_right_us)) {
+        taptic_pulse_active_right = false;
+    }
+    if (taptic_refractory_active_left && time_reached(now, taptic_refractory_end_left_us)) {
+        taptic_refractory_active_left = false;
+    }
+    if (taptic_refractory_active_right && time_reached(now, taptic_refractory_end_right_us)) {
+        taptic_refractory_active_right = false;
+    }
 }
 
 static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_bytes) {
@@ -1223,72 +1255,110 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         return;
     }
 
+    // Constants calibrated for fs = 3000 Hz (matches ds5haptics SimFx)
+    constexpr float ATK_FAST   = 0.0799556f; // 1 - exp(-1 / (0.004 * 3000))
+    constexpr float REL_FAST   = 0.0082987f; // 1 - exp(-1 / (0.040 * 3000))
+    constexpr float SLOW_COEF  = 0.0004761f; // 1 - exp(-1 / (0.700 * 3000))
+    constexpr float REF_DECAY  = 0.9999167f; // exp(-1 / (4.000 * 3000))
+    constexpr float K_FLOOR    = 0.045f;
+    constexpr float K_REF_MIN  = 0.080f;
+    constexpr float K_LOUD     = 0.42f;
+    constexpr float K_TRANS    = 2.35f;
+
     const uint32_t now = time_us_32();
-    float max_attack_left = 0.0f;
-    float max_attack_right = 0.0f;
-    float peak_amp_left = 0.0f;
-    float peak_amp_right = 0.0f;
+    retire_taptic_timers(now);
+
+    bool hit_l = false;
+    bool hit_r = false;
+    float best_ratio_l = 0.0f;
+    float best_ratio_r = 0.0f;
+    float peak_amp_l = 0.0f;
+    float peak_amp_r = 0.0f;
 
     const int pairs = sample_bytes / 2;
     for (int i = 0; i < pairs; ++i) {
-        // Channel 3 = Left Actuator (Heavy voice coil), Channel 4 = Right Actuator (Light voice coil)
-        float l = static_cast<float>(samples[i * 2]) / 127.0f;
-        float r = static_cast<float>(samples[i * 2 + 1]) / 127.0f;
+        // Channel 3 = Left Actuator, Channel 4 = Right Actuator
+        const float l = static_cast<float>(samples[i * 2]) / 127.0f;
+        const float r = static_cast<float>(samples[i * 2 + 1]) / 127.0f;
+        const float abs_l = std::fabs(l);
+        const float abs_r = std::fabs(r);
+        if (abs_l > peak_amp_l) peak_amp_l = abs_l;
+        if (abs_r > peak_amp_r) peak_amp_r = abs_r;
 
-        float abs_l = fabsf(l);
-        float abs_r = fabsf(r);
-        if (abs_l > peak_amp_left) peak_amp_left = abs_l;
-        if (abs_r > peak_amp_right) peak_amp_right = abs_r;
+        const float pl = l * l;
+        const float pr = r * r;
 
-        // Attack slew rate (rate of change between consecutive audio samples)
-        float delta_l = fabsf(l - taptic_last_sample_left);
-        float delta_r = fabsf(r - taptic_last_sample_right);
-        if (delta_l > max_attack_left) max_attack_left = delta_l;
-        if (delta_r > max_attack_right) max_attack_right = delta_r;
+        simfx_p_fast_l += (pl - simfx_p_fast_l) * (pl > simfx_p_fast_l ? ATK_FAST : REL_FAST);
+        simfx_p_fast_r += (pr - simfx_p_fast_r) * (pr > simfx_p_fast_r ? ATK_FAST : REL_FAST);
+        simfx_p_slow_l += (simfx_p_fast_l - simfx_p_slow_l) * SLOW_COEF;
+        simfx_p_slow_r += (simfx_p_fast_r - simfx_p_slow_r) * SLOW_COEF;
 
-        taptic_last_sample_left = l;
-        taptic_last_sample_right = r;
+        const float e_fast_l = std::sqrt(simfx_p_fast_l);
+        const float e_fast_r = std::sqrt(simfx_p_fast_r);
+        const float e_slow_l = std::sqrt(simfx_p_slow_l);
+        const float e_slow_r = std::sqrt(simfx_p_slow_r);
+
+        simfx_ref_l = (e_fast_l > simfx_ref_l) ? e_fast_l : std::fmax(simfx_ref_l * REF_DECAY, K_REF_MIN);
+        simfx_ref_r = (e_fast_r > simfx_ref_r) ? e_fast_r : std::fmax(simfx_ref_r * REF_DECAY, K_REF_MIN);
+
+        if (e_fast_l > K_FLOOR && e_fast_l > K_LOUD * simfx_ref_l && e_fast_l > K_TRANS * std::fmax(e_slow_l, K_FLOOR)) {
+            const float ratio = e_fast_l / std::fmax(simfx_ref_l, K_REF_MIN);
+            if (ratio > best_ratio_l) best_ratio_l = ratio;
+            hit_l = true;
+        }
+        if (e_fast_r > K_FLOOR && e_fast_r > K_LOUD * simfx_ref_r && e_fast_r > K_TRANS * std::fmax(e_slow_r, K_FLOOR)) {
+            const float ratio = e_fast_r / std::fmax(simfx_ref_r, K_REF_MIN);
+            if (ratio > best_ratio_r) best_ratio_r = ratio;
+            hit_r = true;
+        }
     }
 
-    // Combine absolute peak and attack velocity for punchy transient detection
-    float impact_score_left  = fmaxf(peak_amp_left * 0.75f, max_attack_left * 1.5f);
-    float impact_score_right = fmaxf(peak_amp_right * 0.75f, max_attack_right * 1.5f);
+    auto calc_kick_params = [](float intensity, uint32_t min_us, uint32_t max_us, uint8_t &out_pwm) -> uint32_t {
+        if (intensity >= 0.72f) {
+            out_pwm = 255;
+            return max_us;
+        } else if (intensity >= 0.45f) {
+            out_pwm = 225;
+            return (min_us + max_us) / 2;
+        } else {
+            out_pwm = 185;
+            return min_us;
+        }
+    };
 
-    // --- Left Actuator Trigger (Heavy Body Impacts, Landings, Punches) ---
-    // Only trigger if outside refractory window (prevents blurring into continuous buzz)
-    if (impact_score_left >= TAPTIC_ATTACK_THRESHOLD && time_reached(now, taptic_refractory_end_left_us)) {
-        // 18ms pulse: single heavy mechanical stroke of the voice coil
-        taptic_pulse_end_left_us = now + 18000;
-        // 85ms refractory period: enforces crisp silence before the next impact
-        taptic_refractory_end_left_us = now + 85000;
+    if (hit_l && !taptic_refractory_active_left) {
+        const float intensity_l = std::fmin(1.0f, 0.5f * best_ratio_l + 0.5f * peak_amp_l);
+        const uint32_t dur_us = calc_kick_params(intensity_l, 14000u, 20000u, taptic_pwm_left);
+        taptic_pulse_end_left_us = now + dur_us;
+        taptic_pulse_active_left = true;
+        taptic_refractory_end_left_us = now + 80000u;
+        taptic_refractory_active_left = true;
     }
 
-    // --- Right Actuator Trigger (Fast Transients, Web Shoots, Clicks, Snaps) ---
-    if (impact_score_right >= TAPTIC_ATTACK_THRESHOLD && time_reached(now, taptic_refractory_end_right_us)) {
-        // 14ms pulse: ultra-fast snappy click of the light voice coil
-        taptic_pulse_end_right_us = now + 14000;
-        // 75ms refractory period: keeps consecutive web shoots snappy and discrete
-        taptic_refractory_end_right_us = now + 75000;
+    if (hit_r && !taptic_refractory_active_right) {
+        const float intensity_r = std::fmin(1.0f, 0.5f * best_ratio_r + 0.5f * peak_amp_r);
+        const uint32_t dur_us = calc_kick_params(intensity_r, 12000u, 16000u, taptic_pwm_right);
+        taptic_pulse_end_right_us = now + dur_us;
+        taptic_pulse_active_right = true;
+        taptic_refractory_end_right_us = now + 70000u;
+        taptic_refractory_active_right = true;
     }
 
-    // Evaluate active pulse states
-    uint8_t motor_left  = (!time_reached(now, taptic_pulse_end_left_us))  ? 255 : 0;
-    uint8_t motor_right = (!time_reached(now, taptic_pulse_end_right_us)) ? 255 : 0;
+    const uint8_t motor_left  = taptic_pulse_active_left  ? taptic_pwm_left : 0;
+    const uint8_t motor_right = taptic_pulse_active_right ? taptic_pwm_right : 0;
 
-    bool is_zero  = ((motor_right | motor_left) == 0);
-    bool was_zero = ((taptic_last_sent_right | taptic_last_sent_left) == 0);
-    bool changed  = (motor_right != taptic_last_sent_right || motor_left != taptic_last_sent_left);
-    uint32_t elapsed_us = now - taptic_last_send_time_us;
+    const bool is_zero  = ((motor_right | motor_left) == 0);
+    const bool was_zero = ((taptic_last_sent_right | taptic_last_sent_left) == 0);
+    const bool changed  = (motor_right != taptic_last_sent_right || motor_left != taptic_last_sent_left);
+    const uint32_t elapsed_us = now - taptic_last_send_time_us;
 
     if (is_zero && !was_zero) {
-        // Immediate active braking: cuts power immediately to prevent coil drag/ringing
         taptic_last_sent_right = 0;
         taptic_last_sent_left = 0;
         taptic_last_send_time_us = now;
         bt_submit_haptic_synthesis(0, 0);
     } else if (!is_zero) {
-        // Instant pulse dispatch
-        if (changed || elapsed_us >= 8000) {
+        if (changed || elapsed_us >= 8000u) {
             taptic_last_sent_right = motor_right;
             taptic_last_sent_left = motor_left;
             taptic_last_send_time_us = now;
@@ -1298,12 +1368,17 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
 }
 
 static void haptic_synthesis_loop(uint32_t now) {
-    if ((taptic_last_sent_right > 0 || taptic_last_sent_left > 0) &&
-        time_reached(now, taptic_pulse_end_left_us) && time_reached(now, taptic_pulse_end_right_us)) {
-        taptic_last_sent_right = 0;
-        taptic_last_sent_left = 0;
+    retire_taptic_timers(now);
+    if (taptic_last_sent_right == 0 && taptic_last_sent_left == 0) {
+        return;
+    }
+    const uint8_t want_left  = taptic_pulse_active_left  ? taptic_pwm_left : 0;
+    const uint8_t want_right = taptic_pulse_active_right ? taptic_pwm_right : 0;
+    if (want_left != taptic_last_sent_left || want_right != taptic_last_sent_right) {
+        taptic_last_sent_left = want_left;
+        taptic_last_sent_right = want_right;
         taptic_last_send_time_us = now;
-        bt_submit_haptic_synthesis(0, 0);
+        bt_submit_haptic_synthesis(want_right, want_left);
     }
 }
 
@@ -1313,18 +1388,21 @@ static bool __not_in_flash_func(send_haptic_report_0x32)(const int8_t *samples) 
     if (!bt_is_controller_connected() || samples == nullptr) {
         return false;
     }
+    // Exact SAxense / ds5haptics Report 0x32 byte layout
     uint8_t pkt32[142]{};
     pkt32[0] = 0x32;
-    pkt32[1] = 0;
-    pkt32[2] = 0x91;
+    pkt32[1] = 0x00;
+    pkt32[2] = 0x91; // sub-packet 0x11 | 0x80
     pkt32[3] = 0x07;
     pkt32[4] = 0xFE;
-    for (int i = 5; i <= 9; ++i) {
-        pkt32[i] = 16; // ControllerQueueFrames (16 frames per official Sony spec)
-    }
+    pkt32[5] = 0x00;
+    pkt32[6] = 0x00;
+    pkt32[7] = 0x00;
+    pkt32[8] = 0x00;
+    pkt32[9] = 0xFF;
     pkt32[10] = haptic_0x32_counter++;
-    pkt32[11] = 0x92;
-    pkt32[12] = 0x40; // 64 bytes (32 stereo samples at 3 kHz)
+    pkt32[11] = 0x92; // sub-packet 0x12 | 0x80
+    pkt32[12] = 0x40; // 64 bytes (32 stereo s8 frames @ 3000 Hz)
     memcpy(pkt32 + 13, samples, 64);
 
 #ifdef ENABLE_COMPANION
@@ -1847,6 +1925,7 @@ void audio_set_quiet_mode(bool enabled) {
     speaker_route_active = false;
     speaker_route_headset = false;
     last_audio_us = 0;
+    last_nonzero_speaker_us = 0;
     audio_debug_log(
         AudioDebugQuietMode,
         enabled ? 1 : 0,
@@ -2084,6 +2163,9 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
         const int16_t speaker_r = rendered.speaker_right;
         const int16_t haptic_l = rendered.haptic_left;
         const int16_t haptic_r = rendered.haptic_right;
+        if (speaker_l != 0 || speaker_r != 0) {
+            last_nonzero_speaker_us = now;
+        }
         if (speaker_route_demanded) {
             audio_buf[audio_buf_pos++] = static_cast<float>(speaker_l) / 32768.0f * speaker_gain;
             audio_buf[audio_buf_pos++] = static_cast<float>(speaker_r) / 32768.0f * speaker_gain;
@@ -2130,12 +2212,16 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
 
     static WDL_ResampleSample out_buf[SAMPLE_SIZE];
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
+    const bool speaker_active_recently = speaker_route_demanded
+        && last_nonzero_speaker_us != 0
+        && static_cast<uint32_t>(now - last_nonzero_speaker_us) < 250000u;
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
             haptic_synthesis_process_buffer(audio_haptic_buf, SAMPLE_SIZE);
-            if (speaker_route_demanded) {
+            if (speaker_active_recently) {
                 send_audio_haptics_packet(audio_haptic_buf, true);
             } else {
+                clear_pending_audio_batch();
                 send_haptic_report_0x32(audio_haptic_buf);
             }
         }
