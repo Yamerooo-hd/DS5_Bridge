@@ -1261,16 +1261,16 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         return;
     }
 
-    // Constants calibrated for fs = 3000 Hz
+    // Constants calibrated for fs = 3000 Hz across both quiet-floor precision
+    // games (Control Resonant: 0% idle, 1-15% cues) and loud ambient games (Spider-Man).
     constexpr float ATK_FAST   = 0.0799556f; // 1 - exp(-1 / (0.004 * 3000))
     constexpr float REL_FAST   = 0.0082987f; // 1 - exp(-1 / (0.040 * 3000))
-    constexpr float SLOW_COEF  = 0.0004761f; // 1 - exp(-1 / (0.700 * 3000))
-    constexpr float REF_DECAY  = 0.9999167f; // exp(-1 / (4.000 * 3000))
-    constexpr float K_FLOOR    = 0.055f;
-    constexpr float K_REF_MIN  = 0.080f;
-    constexpr float K_LOUD     = 0.28f;
-    constexpr float K_TRANS    = 1.65f;
-    constexpr float SUSTAINED_FLOOR = 0.20f;
+    constexpr float SLOW_COEF  = 0.0006664f; // 1 - exp(-1 / (0.500 * 3000))
+    constexpr float REF_DECAY  = 0.9998333f; // exp(-1 / (2.000 * 3000))
+    constexpr float K_FLOOR    = 0.012f;
+    constexpr float K_REF_MIN  = 0.030f;
+    constexpr float K_LOUD     = 0.15f;
+    constexpr float K_TRANS    = 1.55f;
 
     const uint32_t now = time_us_32();
     retire_taptic_timers(now);
@@ -1283,6 +1283,8 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     float peak_amp_r = 0.0f;
     float end_fast_l = 0.0f;
     float end_fast_r = 0.0f;
+    float end_slow_l = 0.0f;
+    float end_slow_r = 0.0f;
 
     const int pairs = sample_bytes / 2;
     for (int i = 0; i < pairs; ++i) {
@@ -1307,16 +1309,18 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
         const float e_slow_r = std::sqrt(simfx_p_slow_r);
         end_fast_l = e_fast_l;
         end_fast_r = e_fast_r;
+        end_slow_l = e_slow_l;
+        end_slow_r = e_slow_r;
 
         simfx_ref_l = (e_fast_l > simfx_ref_l) ? e_fast_l : std::fmax(simfx_ref_l * REF_DECAY, K_REF_MIN);
         simfx_ref_r = (e_fast_r > simfx_ref_r) ? e_fast_r : std::fmax(simfx_ref_r * REF_DECAY, K_REF_MIN);
 
-        if ((e_fast_l > K_FLOOR && e_fast_l > K_LOUD * simfx_ref_l && e_fast_l > K_TRANS * std::fmax(e_slow_l, K_FLOOR)) || abs_l >= 0.42f) {
+        if ((e_fast_l > K_FLOOR && e_fast_l > K_LOUD * simfx_ref_l && e_fast_l > K_TRANS * std::fmax(e_slow_l, K_FLOOR)) || abs_l >= 0.35f) {
             const float ratio = e_fast_l / std::fmax(simfx_ref_l, K_REF_MIN);
             if (ratio > best_ratio_l) best_ratio_l = ratio;
             hit_l = true;
         }
-        if ((e_fast_r > K_FLOOR && e_fast_r > K_LOUD * simfx_ref_r && e_fast_r > K_TRANS * std::fmax(e_slow_r, K_FLOOR)) || abs_r >= 0.42f) {
+        if ((e_fast_r > K_FLOOR && e_fast_r > K_LOUD * simfx_ref_r && e_fast_r > K_TRANS * std::fmax(e_slow_r, K_FLOOR)) || abs_r >= 0.35f) {
             const float ratio = e_fast_r / std::fmax(simfx_ref_r, K_REF_MIN);
             if (ratio > best_ratio_r) best_ratio_r = ratio;
             hit_r = true;
@@ -1324,46 +1328,48 @@ static void haptic_synthesis_process_buffer(const int8_t *samples, int sample_by
     }
 
     auto calc_kick_params = [](float intensity, uint32_t min_us, uint32_t max_us, uint8_t &out_pwm) -> uint32_t {
-        if (intensity >= 0.65f) {
+        if (intensity >= 0.55f) {
             out_pwm = 255;
             return max_us;
-        } else if (intensity >= 0.38f) {
+        } else if (intensity >= 0.30f) {
             out_pwm = 235;
             return (min_us + max_us) / 2;
         } else {
-            out_pwm = 210;
+            out_pwm = 205;
             return min_us;
         }
     };
 
     if (hit_l && !taptic_refractory_active_left) {
-        const float intensity_l = std::fmin(1.0f, 0.45f * best_ratio_l + 0.55f * peak_amp_l);
-        const uint32_t dur_us = calc_kick_params(intensity_l, 28000u, 44000u, taptic_pwm_left);
+        const float intensity_l = std::fmin(1.0f, 0.65f * best_ratio_l + 0.35f * peak_amp_l);
+        const uint32_t dur_us = calc_kick_params(intensity_l, 26000u, 44000u, taptic_pwm_left);
         taptic_pulse_end_left_us = now + dur_us;
         taptic_pulse_active_left = true;
-        taptic_refractory_end_left_us = now + 55000u;
+        taptic_refractory_end_left_us = now + 50000u;
         taptic_refractory_active_left = true;
     }
 
     if (hit_r && !taptic_refractory_active_right) {
-        const float intensity_r = std::fmin(1.0f, 0.45f * best_ratio_r + 0.55f * peak_amp_r);
-        const uint32_t dur_us = calc_kick_params(intensity_r, 24000u, 38000u, taptic_pwm_right);
+        const float intensity_r = std::fmin(1.0f, 0.65f * best_ratio_r + 0.35f * peak_amp_r);
+        const uint32_t dur_us = calc_kick_params(intensity_r, 22000u, 36000u, taptic_pwm_right);
         taptic_pulse_end_right_us = now + dur_us;
         taptic_pulse_active_right = true;
-        taptic_refractory_end_right_us = now + 50000u;
+        taptic_refractory_end_right_us = now + 45000u;
         taptic_refractory_active_right = true;
     }
 
-    auto map_sustained = [SUSTAINED_FLOOR](float env, float peak) -> uint8_t {
-        const float lvl = std::fmax(env, peak * 0.65f);
-        if (lvl < SUSTAINED_FLOOR) return 0;
-        const float norm = std::fmin(1.0f, (lvl - SUSTAINED_FLOOR) / (1.0f - SUSTAINED_FLOOR));
-        const float pwm = 115.0f + 140.0f * norm;
+    auto map_sustained = [](float env_fast, float env_slow, float peak, float ref) -> uint8_t {
+        const float thresh = std::fmax(0.016f, env_slow * 1.45f);
+        const float lvl = std::fmax(env_fast, peak * 0.72f);
+        if (lvl < thresh) return 0;
+        const float ceil_ref = std::fmax(ref * 0.85f, thresh + 0.08f);
+        const float norm = std::fmin(1.0f, (lvl - thresh) / (ceil_ref - thresh));
+        const float pwm = 95.0f + 160.0f * norm;
         return static_cast<uint8_t>(pwm >= 255.0f ? 255 : (pwm + 0.5f));
     };
 
-    taptic_hold_left = map_sustained(end_fast_l, peak_amp_l);
-    taptic_hold_right = map_sustained(end_fast_r, peak_amp_r);
+    taptic_hold_left = map_sustained(end_fast_l, end_slow_l, peak_amp_l, simfx_ref_l);
+    taptic_hold_right = map_sustained(end_fast_r, end_slow_r, peak_amp_r, simfx_ref_r);
 
     const uint8_t motor_left  = taptic_pulse_active_left  ? taptic_pwm_left  : taptic_hold_left;
     const uint8_t motor_right = taptic_pulse_active_right ? taptic_pwm_right : taptic_hold_right;
