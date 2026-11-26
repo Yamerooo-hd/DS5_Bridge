@@ -5485,6 +5485,12 @@ bool bt_write_classified_output(uint8_t *data, uint16_t len) {
         if (payload_len > ds5::output::kValidFlag2Offset) {
             payload[ds5::output::kValidFlag2Offset] |= ds5::output::kFlag2EnableImprovedRumbleEmulation;
         }
+    } else if (
+        payload_len > ds5::output::kMotorLeftOffset
+        && (payload[ds5::output::kMotorRightOffset] | payload[ds5::output::kMotorLeftOffset]) != 0
+    ) {
+        // Ensure clones also actuate whenever the game sends host classic rumble directly.
+        payload[ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
     }
     apply_player_led_policy_to_payload(payload, payload_len);
 
