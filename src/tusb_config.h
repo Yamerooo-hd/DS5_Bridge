@@ -1,8 +1,14 @@
 #ifndef _SENSA_TUSB_CONFIG_H
 #define _SENSA_TUSB_CONFIG_H
 
+#include "pico/platform/sections.h"
+
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifndef BOARD_TUD_RHPORT
+#define BOARD_TUD_RHPORT 0
 #endif
 
 #ifndef CFG_TUSB_MCU
