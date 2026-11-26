@@ -4532,7 +4532,6 @@ static bool dualsense_output_transport_report(Packet const &packet) {
     }
     const uint8_t report_id = packet.data[1];
     return report_id == DS_OUTPUT_REPORT_BT
-        || report_id == 0x32
         || report_id == 0x39;
 }
 
@@ -5740,11 +5739,16 @@ void bt_submit_haptic_synthesis(uint8_t right, uint8_t left) {
         right,
         left
     );
-    // Guarantee both CompatibleVibration and HapticsSelect flags
-    // so both 3rd-party clone MCUs and genuine Sony DualSense pads actuate.
-    report[3 + ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
     if ((right | left) != 0) {
+        // Guarantee both CompatibleVibration and HapticsSelect flags
+        // so both 3rd-party clone MCUs and genuine Sony DualSense pads actuate.
+        report[3 + ds5::output::kValidFlag0Offset] |= (ds5::output::kFlag0CompatibleVibration | ds5::output::kFlag0HapticsSelect);
         report[3 + ds5::output::kValidFlag2Offset] |= ds5::output::kFlag2EnableImprovedRumbleEmulation;
+    } else {
+        // Clear HapticsSelect when braking so audio-haptics ownership returns
+        // cleanly via COMPATIBLE_VIBRATION alone (per DualSense state machine).
+        report[3 + ds5::output::kValidFlag0Offset] &= static_cast<uint8_t>(~ds5::output::kFlag0HapticsSelect);
+        report[3 + ds5::output::kValidFlag0Offset] |= ds5::output::kFlag0CompatibleVibration;
     }
     bt_write(report, sizeof(report));
 }
