@@ -20,6 +20,8 @@ void bt_set_override_led(uint8_t r, uint8_t g, uint8_t b);
 
 bool bt_copy_cached_feature(uint8_t report_id, uint8_t *buf, uint16_t cap, uint16_t &copied);
 void bt_send_set_feature(uint8_t report_id, uint8_t const *buf, uint16_t len);
+void bt_debug_dump();
+void bt_trigger_unlock_sequence();
 
 } // namespace sensa
 

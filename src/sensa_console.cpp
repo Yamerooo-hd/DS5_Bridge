@@ -78,6 +78,10 @@ void handle_command(char *line) {
         if (!bt_start_sdp_discovery()) {
             console_printf("[SDP] Cannot run: controller ACL not connected\n");
         }
+    } else if (eq_ci(cmd, "dbg")) {
+        bt_debug_dump();
+    } else if (eq_ci(cmd, "unlock")) {
+        bt_trigger_unlock_sequence();
     } else if (eq_ci(cmd, "mode") && argc >= 2) {
         char const *m = tokens[1];
         if (eq_ci(m, "31")) g_haptic_mode = HapticMode::Mode31Synth;

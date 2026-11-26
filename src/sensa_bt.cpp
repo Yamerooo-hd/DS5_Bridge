@@ -39,6 +39,8 @@ bool hid_intr_ready = false;
 bool hid_session_announced = false;
 bool rx_0x31_seen = false;
 bool security_ready = false;
+uint8_t last_intr_rx[20]{};
+uint16_t last_intr_rx_size = 0;
 
 bool pairing_window = false;
 uint32_t pairing_deadline_us = 0;
@@ -433,17 +435,17 @@ void open_hid_channels() {
 }
 
 void on_hid_session_ready() {
-    console_printf("[BT] HID Control+Interrupt READY! Requesting Feature 0x05 (unlock 0x31)\n");
-    static constexpr uint8_t kReqIds[4] = {0x05, 0x03, 0x09, 0x20};
+    console_printf("[BT] HID Control+Interrupt READY! Sending SET_PROTOCOL(Report) + Feature 0x05\n");
+    uint8_t set_proto_report = 0x71; // SET_PROTOCOL | Report Protocol (1)
+    enqueue_ctrl(&set_proto_report, 1);
+    static constexpr uint8_t kReqIds[3] = {0x05, 0x09, 0x20};
     for (uint8_t id : kReqIds) {
         uint8_t cmd[2] = {0x43, id};
         enqueue_ctrl(cmd, 2);
     }
     usb_set_bt_ready(true);
-    state_send_pending = true;
     sdp_auto_pending = true;
     sdp_auto_at_us = time_us_32() + 300000u;
-    request_intr_tx();
 }
 
 void reset_session_state() {
@@ -490,6 +492,9 @@ void convert_short_0x01_to_ds5(uint8_t const *in9, uint8_t out63[63]) {
 void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     if (packet_type == L2CAP_DATA_PACKET) {
         if (channel == hid_intr_cid && size > 2) {
+            uint16_t copy_dbg = std::min<uint16_t>(size, sizeof(last_intr_rx));
+            std::memcpy(last_intr_rx, packet, copy_dbg);
+            last_intr_rx_size = size;
             if (packet[1] == 0x31 && (packet[2] & 0x02u) == 0 && size >= 66) {
                 rx_0x31_seen = true;
                 g_telemetry.bt_0x31_rx_count++;
@@ -949,6 +954,34 @@ void bt_send_set_feature(uint8_t report_id, uint8_t const *buf, uint16_t len) {
     enqueue_ctrl(pkt, static_cast<uint16_t>(len + 2));
 }
 
+void bt_debug_dump() {
+    console_printf("[DBG] last_intr_rx size=%u:", last_intr_rx_size);
+    uint16_t n = std::min<uint16_t>(last_intr_rx_size, sizeof(last_intr_rx));
+    for (uint16_t i = 0; i < n; ++i) console_printf(" %02X", last_intr_rx[i]);
+    console_printf("\n");
+    for (auto const &f : feat_cache) {
+        if (!f.valid) continue;
+        console_printf("[DBG] feat 0x%02X (%uB):", f.id, f.len);
+        uint16_t fn = std::min<uint16_t>(f.len, 16);
+        for (uint16_t i = 0; i < fn; ++i) console_printf(" %02X", f.data[i]);
+        console_printf("\n");
+    }
+}
+
+void bt_trigger_unlock_sequence() {
+    if (!hid_ctrl_ready || !hid_intr_ready) {
+        console_printf("[BT] Unlock skipped: channels not ready\n");
+        return;
+    }
+    uint8_t set_proto = 0x71;
+    enqueue_ctrl(&set_proto, 1);
+    uint8_t req5[2] = {0x43, 0x05};
+    enqueue_ctrl(req5, 2);
+    state_send_pending = true;
+    request_intr_tx();
+    console_printf("[BT] Sent SET_PROTOCOL(Report) + GET_FEATURE(0x05) + 0x31\n");
+}
+
 void bt_poll() {
     cyw43_arch_poll();
     uint32_t now_us = time_us_32();
@@ -989,17 +1022,15 @@ void bt_poll() {
 
     if (!hid_intr_ready) return;
 
-    // Pull next 64B DSP waveform block once 0x31 mode is unlocked
-    if (rx_0x31_seen) {
-        int8_t block[64];
-        HapticMode wave_proto = g_haptic_mode;
-        if (dsp_take_haptic_block(block, wave_proto)) {
-            if (wave_proto == HapticMode::Mode32SAxense ||
-                wave_proto == HapticMode::Mode36Haptics ||
-                wave_proto == HapticMode::Mode39Probe ||
-                wave_proto == HapticMode::Mode31Hybrid32) {
-                bt_submit_haptic_waveform(block, wave_proto);
-            }
+    // Pull next 64B DSP waveform block whenever ready (works even before rx0x31 unlocks)
+    int8_t block[64];
+    HapticMode wave_proto = g_haptic_mode;
+    if (dsp_take_haptic_block(block, wave_proto)) {
+        if (wave_proto == HapticMode::Mode32SAxense ||
+            wave_proto == HapticMode::Mode36Haptics ||
+            wave_proto == HapticMode::Mode39Probe ||
+            wave_proto == HapticMode::Mode31Hybrid32) {
+            bt_submit_haptic_waveform(block, wave_proto);
         }
     }
 
