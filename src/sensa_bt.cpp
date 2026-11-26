@@ -724,7 +724,7 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         case HCI_EVENT_PIN_CODE_REQUEST: {
             bd_addr_t addr;
             hci_event_pin_code_request_get_bd_addr(packet, addr);
-            pin_code_t pin{};
+            uint8_t pin[16]{};
             std::memcpy(pin, "0000", 4);
             hci_send_cmd(&hci_pin_code_request_reply, addr, 4, pin);
             break;

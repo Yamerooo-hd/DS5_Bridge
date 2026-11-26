@@ -123,7 +123,7 @@ void usb_init() {
         .role = TUSB_ROLE_DEVICE,
         .speed = TUSB_SPEED_FULL,
     };
-    tusb_init(BOARD_TUD_RHPORT, &dev_init);
+    tusb_init(0, &dev_init);
     usb_attached = true;
 }
 
