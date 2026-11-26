@@ -31,12 +31,14 @@ inline char const *haptic_mode_name(HapticMode mode) {
 }
 
 struct DspConfig {
-    // Tuned for quiet games like Control Resonant (1%..15% cues) while rejecting noise floor
-    uint8_t noise_floor_pct = 1;       // Ignore ch3/ch4 signal below 1.0% peak
-    uint16_t gain_x10 = 26;            // 2.6x overall scaling on raw haptic delta
-    uint8_t min_rumble = 22;           // Minimum motor drive once triggered (overcomes motor stiction)
-    uint16_t hold_ms = 55;             // Sustain window per impact
-    uint16_t decay_ms = 110;           // Decay window after hold
+    // Tuned defaults baked from live-tuning session (Control Resonant):
+    // floor=8% eliminates idle buzz, gain=3.0x, min=10 (overcomes stiction without buzz),
+    // hold=25ms (sharp cues), decay=55ms (clean tail)
+    uint8_t noise_floor_pct = 8;       // Ignore ch3/ch4 signal below 8.0% peak
+    uint16_t gain_x10 = 30;            // 3.0x overall scaling on raw haptic delta
+    uint8_t min_rumble = 10;           // Minimum motor drive once triggered (overcomes motor stiction)
+    uint16_t hold_ms = 25;             // Sustain window per impact
+    uint16_t decay_ms = 55;            // Decay window after hold
     bool include_speaker_bass = true;  // Fold ch0/ch1 sub-bass transients subtly when ch3/4 present or strong explosion
     uint16_t speaker_bass_pct = 20;    // 0..100% weight of low-freq speaker energy above 25% threshold
     uint8_t haptic_gain_pct = 100;     // PCM waveform scale for 0x32 / 0x36 (50..300%)

@@ -352,6 +352,16 @@ void build_0x31_packet(uint8_t out_pkt[79], bool allow_synth_motors, bool clear_
     g_telemetry.last_sent_right = p[2];
     g_telemetry.last_sent_left = p[3];
 
+    // --- Mic Mute LED: always drive to OFF unless explicitly set by USB host ---
+    // Byte p[0] bit0 = CompatibleVibration, bit1 = HapticsSelect,
+    // Byte p[1] bit0 = MicMuteLedControlEnable (Flag1 bit0).
+    // The raw USB 0x02 output often has MicMuteLedControlEnable=1 and mute_led=1 (p[8])
+    // which forces the mic LED on. We always clamp it here: LED control enabled = yes
+    // (so we can explicitly drive it), but mute_led value = 0 (OFF) unless a future
+    // explicit "mic mute ON" command sets an internal flag.
+    p[1] |= 0x01u;  // MicMuteLedControlEnable: tell controller we are controlling it
+    p[8] = 0x00;    // mute_led_mode = off (not muted = LED off)
+
     if (led_override_active) {
         p[1] |= 0x04u; // Lightbar control enable
         p[44] = led_override_r;
